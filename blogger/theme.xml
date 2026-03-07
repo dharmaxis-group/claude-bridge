@@ -372,7 +372,7 @@ a:hover { color: var(--accent-hover); }
 <main>
 
 <!-- Hero + Features: Homepage only -->
-<b:if cond='data:blog.homepageUrl == data:blog.url'>
+<b:if cond='data:view.isHomepage'>
   <section class='hero'>
     <div class='hero-badge'>Open Source Bridge Service</div>
     <h1>Control Claude Code<br/>From Anywhere</h1>
@@ -414,80 +414,16 @@ a:hover { color: var(--accent-hover); }
   </section>
 </b:if>
 
-<!-- Blog Posts -->
+<!-- Blog Posts (rendered via JSON Feed API) -->
 <section class='posts-section' id='changelog'>
   <div class='section-title'>Latest Updates</div>
-  <b:section class='main' id='main' showaddelement='no'>
-    <b:widget id='Blog1' locked='true' title='Blog Posts' type='Blog' version='2'>
-      <b:includable id='main' var='this'>
-        <b:loop values='data:posts' var='post'>
-          <b:include data='post' name='post'/>
-        </b:loop>
-        <!-- Pager -->
-        <b:include name='nextprev'/>
-      </b:includable>
-
-      <b:includable id='post' var='post'>
-        <b:if cond='data:blog.homepageUrl == data:blog.url'>
-          <!-- Homepage: card list -->
-          <a class='post-card' expr:href='data:post.url'>
-            <div class='post-title'><data:post.title/></div>
-            <div class='post-meta'><data:post.date/></div>
-            <div class='post-snippet'><data:post.snippets.short/></div>
-            <b:if cond='data:post.labels'>
-              <div class='post-labels'>
-                <b:loop values='data:post.labels' var='label'>
-                  <span class='label-tag'><data:label.name/></span>
-                </b:loop>
-              </div>
-            </b:if>
-          </a>
-        <b:else/>
-          <!-- Single post view -->
-          <article class='post-view'>
-            <h1 class='post-view-title'><data:post.title/></h1>
-            <div class='post-view-meta'><data:post.date/></div>
-            <div class='post-body'><data:post.body/></div>
-            <b:if cond='data:post.labels'>
-              <div class='post-labels' style='margin-top:24px'>
-                <b:loop values='data:post.labels' var='label'>
-                  <span class='label-tag'><data:label.name/></span>
-                </b:loop>
-              </div>
-            </b:if>
-          </article>
-        </b:if>
-      </b:includable>
-
-      <b:includable id='nextprev'>
-        <div style='display:flex;justify-content:center;gap:16px;padding:24px 0;'>
-          <b:if cond='data:newerPageUrl'>
-            <a class='btn btn-secondary' expr:href='data:newerPageUrl'>&#x2190; Newer</a>
-          </b:if>
-          <b:if cond='data:olderPageUrl'>
-            <a class='btn btn-secondary' expr:href='data:olderPageUrl'>Older &#x2192;</a>
-          </b:if>
-        </div>
-      </b:includable>
-
-      <!-- Required empty includables -->
-      <b:includable id='postQuickEdit'/>
-      <b:includable id='headerByline'/>
-      <b:includable id='footerBylines'/>
-      <b:includable id='feedLinks'/>
-      <b:includable id='feedLinksBody'/>
-      <b:includable id='postCommentsLink'/>
-      <b:includable id='threadedComments'/>
-      <b:includable id='backlinks'/>
-      <b:includable id='postFooter'/>
-      <b:includable id='postHeader'/>
-      <b:includable id='shareButtons'/>
-      <b:includable id='commentForm'/>
-      <b:includable id='comments'/>
-      <b:includable id='status-message'/>
-    </b:widget>
-  </b:section>
+  <div id='posts-container'><div style='color:var(--text-muted);font-size:13px;'>Loading posts...</div></div>
 </section>
+
+<!-- Hidden Blog widget (required by Blogger) -->
+<b:section class='main' id='main' showaddelement='no'>
+  <b:widget id='Blog1' locked='true' title='Blog Posts' type='Blog' version='2' visible='false'/>
+</b:section>
 
 </main>
 
@@ -495,6 +431,51 @@ a:hover { color: var(--accent-hover); }
 <footer class='footer'>
   claudebridge.blogspot.com &#xB7; Built with Claude Max
 </footer>
+
+<!-- Render posts via JSONP callback -->
+<script type='text/javascript'>
+//<![CDATA[
+function renderBlogPosts(data){
+  var container = document.getElementById('posts-container');
+  if(!container) return;
+  try {
+    var entries = data.feed.entry;
+    if(!entries || entries.length === 0){ container.innerHTML='<div style="color:var(--text-muted)">No posts yet</div>'; return; }
+    var html = '';
+    for(var i=0; i<entries.length; i++){
+      var e = entries[i];
+      var title = e.title.$t || '';
+      var published = e.published.$t || '';
+      var dateStr = published.substring(0,10);
+      var url = '';
+      for(var j=0; j<e.link.length; j++){
+        if(e.link[j].rel === 'alternate'){ url = e.link[j].href; break; }
+      }
+      var snippet = '';
+      if(e.content) snippet = e.content.$t.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').substring(0,280).trim() + '...';
+      var labels = '';
+      if(e.category){
+        labels = '<div class="post-labels">';
+        for(var k=0; k<e.category.length; k++){
+          labels += '<span class="label-tag">' + e.category[k].term + '</span>';
+        }
+        labels += '</div>';
+      }
+      html += '<a class="post-card" href="'+url+'">'
+        + '<div class="post-title">'+title+'</div>'
+        + '<div class="post-meta">'+dateStr+'</div>'
+        + '<div class="post-snippet">'+snippet+'</div>'
+        + labels + '</a>';
+    }
+    container.innerHTML = html;
+  } catch(ex) {
+    container.innerHTML='<div style="color:#f87171">Error: '+ex.message+'</div>';
+  }
+}
+//]]>
+</script>
+<script expr:src='&quot;/feeds/posts/default?alt=json-in-script&amp;callback=renderBlogPosts&amp;max-results=10&quot;'/>
+
 
 </body>
 </html>

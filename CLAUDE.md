@@ -45,6 +45,17 @@
 
 核对完成后，相关文件自然产生 diff，后续步骤正常检测推送。
 
+**Step 0.5：Blogger 发布判断**
+仅当本次会话包含**新功能或重要修复**时才发布博客文章。以下情况**不发**：
+- 纯内部配置变更（CLAUDE.md 调整、sync pipeline 优化等）
+- 文档更新、KB 维护
+- 安全操作细节、个人路径、内部配置调整等敏感信息不写入博客
+
+发布命令：
+```
+python3 ~/.openclaw/scripts/blogger-manager.py publish-post --title "标题" --file 文件 --blog 5622917632055974047 --labels "标签"
+```
+
 **Step 1：一键推送**
 Code 完成所有文件编辑后，调用一次 sync-pipeline.py 完成全部 git + 外部推送：
 ```
