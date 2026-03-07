@@ -1,0 +1,53 @@
+<h2>What's New</h2>
+
+<h3>🔒 P0 Security Fix: Tool Profiles Now Actually Work</h3>
+
+<p>We discovered that Claude Bridge's <code>readonly</code> tool profile was <strong>completely ineffective</strong>. The <code>--allowedTools</code> CLI flag, which we used to restrict Claude's tool access, does nothing in <code>-p</code> (non-interactive) mode. Claude had full access to Bash, Write, and Edit regardless of the selected profile.</p>
+
+<p><strong>Root cause:</strong> <code>--allowedTools</code> is a permission whitelist that pre-approves tools for interactive confirmation. But <code>-p</code> mode skips all interactive confirmation, making the flag meaningless.</p>
+
+<p><strong>Fix:</strong> Switched to <code>--tools</code>, which controls the actual available tool set. Tools excluded by <code>--tools</code> completely disappear from Claude's perspective — it can't see or use them.</p>
+
+<table>
+<tr><th>Profile</th><th>Tools Available</th><th>Use Case</th></tr>
+<tr><td>readonly (default)</td><td>Read, Grep, Glob, WebSearch, WebFetch</td><td>Safe queries, no side effects</td></tr>
+<tr><td>standard</td><td>All tools (default)</td><td>Full access for trusted operations</td></tr>
+<tr><td>restricted</td><td>Read, Grep, Glob</td><td>Strictest — no Bash, no network</td></tr>
+</table>
+
+<p><strong>Important finding:</strong> <code>--tools</code> doesn't support fine-grained Bash patterns like <code>Bash(ls:*)</code>. It's all-or-nothing — either Bash is available or it isn't. This is a Claude Code CLI limitation.</p>
+
+<h3>⚡ New Feature: <code>/task</code> — Two-Phase Task Orchestration</h3>
+
+<p>The new <code>/task</code> command implements a "Plan D" architecture: <strong>readonly analysis → user confirmation → full execution</strong>.</p>
+
+<h4>How it works</h4>
+
+<pre><code>/task Check disk usage and clean up files larger than 100MB in /tmp</code></pre>
+
+<ol>
+<li><strong>Phase 1 (readonly):</strong> Claude analyzes the situation using only read tools. It reads files, checks status, and produces a plan — but cannot execute any changes.</li>
+<li><strong>Phase 2 (confirm):</strong> The analysis is sent to Telegram with [Execute] / [Cancel] buttons. You review the plan.</li>
+<li><strong>Phase 3 (execute):</strong> If you click Execute, Claude resumes the same session with full tool access and carries out the plan.</li>
+</ol>
+
+<h4>Why this design?</h4>
+
+<p>We evaluated four architectures for multi-step task orchestration:</p>
+<ul>
+<li><strong>Plan A:</strong> Let Claude handle everything in one shot → no safety gate for destructive operations</li>
+<li><strong>Plan B:</strong> CB parses Markdown into steps → brittle, format-dependent</li>
+<li><strong>Plan C:</strong> Two-phase with Claude parsing steps into JSON → orchestrator-on-orchestrator (Claude Code already has an agentic loop)</li>
+<li><strong>Plan D (chosen):</strong> Readonly analysis + confirmation + full execution → simplest, ~75 lines of code, leverages <code>--resume</code> for state continuity</li>
+</ul>
+
+<p>Key insight: in readonly mode, Claude <strong>gracefully degrades</strong> to text suggestions. When it can't execute <code>rm</code> or <code>git push</code>, it doesn't crash — it simply tells you what it would do and recommends you run the command yourself. This behavior is exactly what we need for the analysis phase.</p>
+
+<h3>Technical Details</h3>
+
+<ul>
+<li><code>/task</code> supports both inline text (<code>/task do X</code>) and reply-to-message (<code>/task</code> as a reply)</li>
+<li>Uses the same session (<code>--resume</code>) across phases, so Claude retains full context</li>
+<li>No new database tables — session state is sufficient</li>
+<li>Cost tracking works for both phases independently</li>
+</ul>
