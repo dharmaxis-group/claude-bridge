@@ -80,8 +80,18 @@ log = logging.getLogger("claude-bridge")
 # ── 配置读取 ──
 
 def load_config() -> dict:
+    import subprocess as _sp
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        cfg = json.load(f)
+    for k, v in cfg.items():
+        if isinstance(v, str) and v.startswith("!"):
+            cmd = v[1:]
+            try:
+                cfg[k] = _sp.check_output(cmd, shell=True, text=True).strip()
+            except _sp.CalledProcessError as e:
+                print(f"Shell expansion failed for {k}: {e}", file=sys.stderr)
+                sys.exit(1)
+    return cfg
 
 
 def get_claude_bin() -> Path:
@@ -412,7 +422,15 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(f"Error: {result['error'][:500]}")
         return
 
-    reply_text = result.get("result", "") or "(empty response)"
+    reply_text = result.get("result", "")
+    if not reply_text:
+        stop = result.get("stop_reason", "unknown")
+        if stop == "tool_use":
+            reply_text = "(Claude used tools but didn't produce a text response. The operation may have completed silently.)"
+        elif stop == "max_turns":
+            reply_text = "(Reached max turns limit)"
+        else:
+            reply_text = f"(empty response, stop_reason={stop})"
     new_session_id = result.get("session_id", session_id)
     cost = result.get("total_cost_usd", 0.0)
     turns = result.get("num_turns", 1)
