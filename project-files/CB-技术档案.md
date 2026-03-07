@@ -410,8 +410,45 @@ CB 在设计时调研了两个开源项目：
 | 2026-03-07 12:04 | Bug 修复 #1：frozen Message 导致图片静默失败 → 独立 handle_photo |
 | 2026-03-07 12:12 | Bug 修复 #2：`-` 开头消息报 unknown option → stdin pipe |
 | 2026-03-07 12:34 | 架构独立：从 OpenClaw 搬出到 `~/.claude-bridge/`，消除全部 OpenClaw 依赖 |
+| 2026-03-07 15:30 | 博客初始化：claudebridge.blogspot.com 主题部署 + 首篇 Changelog 发布 |
 
-## 十五、维护指南
+## 十五、博客
+
+博客地址：https://claudebridge.blogspot.com
+Blog ID：`5622917632055974047`
+管理工具：`~/.openclaw/scripts/blogger-manager.py`（复用 OpenClaw 工具链）
+主题文件：`~/.claude-bridge/blogger/theme.xml`
+文章目录：`~/.claude-bridge/blogger/posts/`
+
+### 博客定位
+
+- 受众：技术开发者（自部署）+ Claude/AI 重度用户（直接使用）
+- 内容：Changelog / 技术架构深度文章 / 使用教程 / 开发故事
+- 风格：工程师视角，诚实直接，有技术深度，不写营销软文
+- 更新触发：每次新功能/重要修复即发布
+- 语言：中英双语
+
+### 主题设计
+
+- 暗色系科技感，蓝紫色系（区别于 OpenClaw 的 Apple HIG 浅色风格）
+- 根路径显示产品主页（Hero + 核心特性卡片 + 最新文章列表）
+- 文章页独立排版，响应式移动端友好
+- 主题通过 CDP 推送（push-blogger-theme.py，`--blog-id` 参数指定博客）
+
+### 发布命令
+
+```bash
+# 发布文章
+python3 ~/.openclaw/scripts/blogger-manager.py publish-post \
+  --title "Title" --file ~/.claude-bridge/blogger/posts/xxx.html \
+  --labels "changelog,release" --blog 5622917632055974047
+
+# 更新主题
+python3 ~/.openclaw/scripts/blogger-manager.py update-theme \
+  --file ~/.claude-bridge/blogger/theme.xml --blog 5622917632055974047
+```
+
+## 十六、维护指南
 
 ### 日常运维
 

@@ -1,0 +1,47 @@
+<h2>What is Claude Bridge?</h2>
+
+<p>Claude Bridge is a lightweight bridge service connecting <strong>Telegram</strong> to <strong>Claude Code CLI</strong>, letting you control Claude Code from anywhere via your phone. No extra servers, no API costs — just your Mac running Claude Code and a Telegram bot.</p>
+
+<h2>Key Features</h2>
+
+<ul>
+  <li><strong>Zero extra API cost</strong> — reuses your Claude Max subscription ($100/mo). The bridge is just I/O; all intelligence comes from <code>claude -p</code></li>
+  <li><strong>Multi-project management</strong> — switch between projects with <code>/p</code>. Each project gets its own CLAUDE.md, session state, and cost tracking</li>
+  <li><strong>Session persistence</strong> — SQLite-backed sessions with <code>--resume</code> support. Pick up where you left off</li>
+  <li><strong>Image support</strong> — send photos from Telegram, Claude reads them via the Read tool</li>
+  <li><strong>Cost tracking</strong> — daily budget limits, per-project cost breakdown, 7-day history via <code>/cost</code></li>
+  <li><strong>InlineKeyboard UI</strong> — interactive buttons for project selection, model switching, tool permissions</li>
+</ul>
+
+<h2>Architecture Highlights</h2>
+
+<ul>
+  <li><strong>stdin pipe for messages</strong> — CLI args would choke on <code>-</code> prefixed Chinese text (parsed as flags). stdin solves this cleanly</li>
+  <li><strong>Environment isolation</strong> — subprocess unsets <code>CLAUDECODE</code> and <code>CLAUDE_PROJECT_DIR</code> to prevent nested session detection</li>
+  <li><strong>LaunchAgent with KeepAlive</strong> — automatic restart on crash, boot-time startup, throttle interval for stability</li>
+  <li><strong>Bot Token in macOS Keychain</strong> — never stored in plaintext config files</li>
+  <li><strong>Per-user FIFO lock + global semaphore</strong> — prevents session conflicts while limiting total concurrent workers</li>
+</ul>
+
+<h2>Tool Permission Profiles</h2>
+
+<p>Three built-in profiles switchable via <code>/tools</code>:</p>
+
+<ul>
+  <li><strong>readonly</strong> (default) — Read, Grep, Glob, WebSearch, plus safe shell commands</li>
+  <li><strong>standard</strong> — full Read/Write/Edit/Bash access</li>
+  <li><strong>restricted</strong> — Read, Grep, Glob, WebSearch only</li>
+</ul>
+
+<h2>What's Next</h2>
+
+<ul>
+  <li>Document message support (PDF, code files)</li>
+  <li>UTC+8 timezone fix for cost statistics</li>
+  <li>Performance evaluation: MAX_CONCURRENT_WORKERS 2 → 4</li>
+  <li>Forward message handling</li>
+  <li>Markdown rendering improvement for Telegram MarkdownV2</li>
+</ul>
+
+<hr/>
+<p><em>Claude Bridge is built by a developer who wanted to <code>ssh</code> into Claude Code from the couch. It's a one-day project that actually works.</em></p>

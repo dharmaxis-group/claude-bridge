@@ -54,3 +54,21 @@ python3 ~/.claude-bridge/sync-pipeline.py
 1. git add -A && commit && push
 2. push-project-files.py（推 Claude.ai Project Files）
 3. manage-kb-drive.py sync（推 Google Drive KB）
+
+## 博客管理
+
+博客：claudebridge.blogspot.com（公开，面向开源用户）
+Blog ID：5622917632055974047
+工具：python3 ~/.openclaw/scripts/blogger-manager.py
+主题文件：~/.claude-bridge/blogger/theme.xml
+文章目录：~/.claude-bridge/blogger/posts/
+
+定位：技术开发者 + Claude/AI 重度用户
+内容：Changelog / 技术架构 / 教程 / 开发故事
+风格：工程师视角，诚实直接，中英双语
+更新触发：每次新功能/重要修复
+
+发布流程：
+1. 写文章 HTML → ~/.claude-bridge/blogger/posts/
+2. python3 ~/.openclaw/scripts/blogger-manager.py publish-post --title "T" --file F --blog 5622917632055974047 --labels "L1,L2"
+3. sync-pipeline.py 同步
