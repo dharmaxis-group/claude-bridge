@@ -271,7 +271,8 @@ def status_text(active: dict, session: dict | None, daily: float) -> str:
 # ── Claude Invoker ──
 
 async def invoke_claude(message: str, project_path: str, session_id: str | None,
-                        model: str, tool_profile: str, effort: str = "medium") -> dict:
+                        model: str, tool_profile: str, effort: str = "medium",
+                        bypass_permissions: bool = False) -> dict:
     claude_bin = get_claude_bin()
     cmd = [
         str(claude_bin), "-p",
@@ -281,6 +282,8 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         "--effort", effort,
         "--tools", TOOL_PROFILES.get(tool_profile, TOOL_PROFILES["readonly"]),
     ]
+    if bypass_permissions:
+        cmd.extend(["--permission-mode", "bypassPermissions"])
     if session_id:
         cmd.extend(["--resume", session_id])
 
@@ -838,6 +841,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         model=active["model"],
                         tool_profile="standard",
                         effort=active["effort"],
+                        bypass_permissions=True,
                     )
                 finally:
                     stop_typing.set()
