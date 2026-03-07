@@ -1,5 +1,17 @@
+# Runtime data
 data/
 logs/
-config.json
 *.db
 *.log
+
+# Private config (use config.example.json as template)
+config.json
+
+# Internal project management (not for public repo)
+project-files/
+kb-content/
+sync-pipeline.py
+CLAUDE.md
+
+# macOS
+.DS_Store
