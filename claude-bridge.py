@@ -21,6 +21,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.request import HTTPXRequest
 
 # ── 路径与常量 ──
 
@@ -868,8 +869,8 @@ def main():
     app = (
         Application.builder()
         .token(token)
-        .proxy(proxy)
-        .get_updates_proxy(proxy)
+        .request(HTTPXRequest(connection_pool_size=16, pool_timeout=30.0, proxy=proxy))
+        .get_updates_request(HTTPXRequest(connection_pool_size=4, pool_timeout=10.0, proxy=proxy))
         .post_init(post_init)
         .build()
     )
