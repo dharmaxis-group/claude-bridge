@@ -43,16 +43,9 @@ DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
 
 TOOL_PROFILES = {
-    "readonly": (
-        "Read,Grep,Glob,WebSearch,WebFetch,"
-        "Bash(cat *),Bash(head *),Bash(tail *),Bash(ls *),Bash(wc *),"
-        "Bash(launchctl list *),Bash(docker ps *),Bash(docker logs *),"
-        "Bash(git log *),Bash(git status *),Bash(git diff *),"
-        "Bash(df *),Bash(uptime),Bash(date),Bash(which *),Bash(python3 --version),"
-        "Bash(pip3 list *),Bash(brew list *)"
-    ),
-    "standard": "Read,Write,Edit,Grep,Glob,WebSearch,WebFetch,Bash",
-    "restricted": "Read,Grep,Glob,WebSearch,WebFetch",
+    "readonly": "Read,Grep,Glob,WebSearch,WebFetch",
+    "standard": "default",
+    "restricted": "Read,Grep,Glob",
 }
 DEFAULT_TOOL_PROFILE = "readonly"
 
@@ -286,7 +279,7 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         "--max-turns", str(MAX_TURNS),
         "--model", model,
         "--effort", effort,
-        "--allowedTools", TOOL_PROFILES.get(tool_profile, TOOL_PROFILES["readonly"]),
+        "--tools", TOOL_PROFILES.get(tool_profile, TOOL_PROFILES["readonly"]),
     ]
     if session_id:
         cmd.extend(["--resume", session_id])
@@ -823,6 +816,126 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "dismiss":
             await query.edit_message_text("Continuing session.")
 
+    # ── task_exec:<session_id> / task_cancel ──
+    elif data.startswith("task_exec:"):
+        target_session = data.split(":", 1)[1]
+        active = get_active_project(chat_id_str)
+        if not active:
+            await query.edit_message_text("No active project.")
+            return
+        await query.edit_message_text("Executing...")
+        lock = get_user_lock(chat_id_str)
+        async with lock:
+            async with worker_semaphore:
+                stop_typing = asyncio.Event()
+                typing_task = asyncio.create_task(
+                    send_typing_loop(context, chat_id, stop_typing))
+                try:
+                    result = await invoke_claude(
+                        message="User confirmed. Execute the operations described above.",
+                        project_path=active["path"],
+                        session_id=target_session,
+                        model=active["model"],
+                        tool_profile="standard",
+                        effort=active["effort"],
+                    )
+                finally:
+                    stop_typing.set()
+                    await typing_task
+        if result.get("error") and not result.get("result"):
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"Error: {result['error'][:500]}")
+            return
+        new_sid = result.get("session_id", target_session)
+        cost = result.get("total_cost_usd", 0.0)
+        turns = result.get("num_turns", 1)
+        duration = result.get("duration_ms", 0)
+        upsert_session(chat_id_str, active["project"], new_sid, active["model"], turns, cost)
+        log_cost(chat_id_str, active["project"], cost, turns, duration)
+        reply = result.get("result", "") or "(no output)"
+        cost_tag = f"\n\n`standard | {active['model']} | ${cost:.4f} | {duration/1000:.1f}s`"
+        await send_long_message(context, chat_id, reply + cost_tag)
+
+    elif data == "task_cancel":
+        await query.edit_message_text("Task cancelled.")
+
+
+# ── /task 拦截式编排 ──
+
+async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/task — readonly 分析 → 确认 → standard 执行"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id = update.effective_chat.id
+    chat_id_str = str(chat_id)
+
+    task_text = " ".join(context.args) if context.args else ""
+    if update.message.reply_to_message and update.message.reply_to_message.text:
+        task_text = update.message.reply_to_message.text + ("\n\n" + task_text if task_text else "")
+    if not task_text.strip():
+        await update.message.reply_text("Usage: /task <description> or reply to a message with /task")
+        return
+
+    active = get_active_project(chat_id_str)
+    if not active:
+        await update.message.reply_text("No active project. Use /p")
+        return
+    if not Path(active["path"]).exists():
+        await update.message.reply_text(f"Path not found: {active['path']}")
+        return
+
+    daily_cost = get_daily_cost(chat_id_str)
+    cfg = load_config()
+    if daily_cost >= cfg.get("dailyBudget", DAILY_BUDGET_USD):
+        await update.message.reply_text("Daily budget reached.")
+        return
+
+    session = get_session(chat_id_str, active["project"])
+    session_id = session["session_id"] if session else None
+
+    # Phase 1: readonly analysis
+    lock = get_user_lock(chat_id_str)
+    async with lock:
+        async with worker_semaphore:
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
+            try:
+                result = await invoke_claude(
+                    message=task_text,
+                    project_path=active["path"],
+                    session_id=session_id,
+                    model=active["model"],
+                    tool_profile="readonly",
+                    effort=active["effort"],
+                )
+            finally:
+                stop_typing.set()
+                await typing_task
+
+    if result.get("error") and not result.get("result"):
+        await update.message.reply_text(f"Error: {result['error'][:500]}")
+        return
+
+    new_session_id = result.get("session_id", session_id)
+    cost = result.get("total_cost_usd", 0.0)
+    turns = result.get("num_turns", 1)
+    duration = result.get("duration_ms", 0)
+
+    upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
+    log_cost(chat_id_str, active["project"], cost, turns, duration)
+
+    analysis = result.get("result", "") or "(empty analysis)"
+    cost_tag = f"\n\n`readonly | {active['model']} | ${cost:.4f} | {duration/1000:.1f}s`"
+
+    # Phase 2: send analysis + confirm/cancel buttons
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Execute", callback_data=f"task_exec:{new_session_id}"),
+         InlineKeyboardButton("Cancel", callback_data="task_cancel")],
+    ])
+    await send_long_message(context, chat_id, analysis + cost_tag)
+    await context.bot.send_message(
+        chat_id=chat_id, text="Execute the suggested operations?", reply_markup=kb)
+
 
 # ── Error Handler ──
 
@@ -842,6 +955,7 @@ async def post_init(app: Application):
         BotCommand("new", "New session"),
         BotCommand("status", "Status & settings"),
         BotCommand("cost", "Cost summary"),
+        BotCommand("task", "Readonly analyze, then execute"),
         BotCommand("help", "Help"),
     ])
     log.info("Claude Bridge started")
@@ -884,6 +998,7 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
