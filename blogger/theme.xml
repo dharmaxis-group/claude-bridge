@@ -515,11 +515,20 @@ a:hover { color: var(--accent-hover); }
   </section>
 </b:if>
 
-<!-- Blog Posts (rendered via JSON Feed API) -->
+<!-- Static Page content (rendered via JS on /p/ URLs) -->
+<b:if cond='data:blog.pageType == &quot;static_page&quot;'>
+  <article class='post-view' id='page-content'>
+    <div style='color:var(--text-muted);font-size:13px;'>Loading...</div>
+  </article>
+</b:if>
+
+<!-- Blog Posts (rendered via JSON Feed API, hidden on static pages) -->
+<b:if cond='data:blog.pageType != &quot;static_page&quot;'>
 <section class='posts-section' id='changelog'>
   <div class='section-title'>Latest Updates</div>
   <div id='posts-container'><div style='color:var(--text-muted);font-size:13px;'>Loading posts...</div></div>
 </section>
+</b:if>
 
 <!-- Hidden Blog widget (required by Blogger) -->
 <b:section class='main' id='main' showaddelement='no'>
@@ -552,6 +561,35 @@ a:hover { color: var(--accent-hover); }
     document.body.style.overflow = '';
   };
 })();
+
+/* Render static page content via JSONP */
+function renderPageContent(data){
+  var container = document.getElementById('page-content');
+  if(!container) return;
+  try {
+    var entries = data.feed.entry;
+    if(!entries || entries.length === 0){ container.innerHTML='<div style="color:var(--text-muted)">Page not found</div>'; return; }
+    var path = window.location.pathname;
+    for(var i=0; i<entries.length; i++){
+      var e = entries[i];
+      for(var j=0; j<e.link.length; j++){
+        if(e.link[j].rel === 'alternate'){
+          var u = new URL(e.link[j].href);
+          if(u.pathname === path){
+            var title = e.title.$t || '';
+            var body = e.content ? e.content.$t : '';
+            container.innerHTML = '<h1 class="post-view-title">'+title+'</h1>'
+              + '<div class="post-body">'+body+'</div>';
+            return;
+          }
+        }
+      }
+    }
+    container.innerHTML='<div style="color:var(--text-muted)">Page not found</div>';
+  } catch(ex) {
+    container.innerHTML='<div style="color:#f87171">Error: '+ex.message+'</div>';
+  }
+}
 
 /* Render posts via JSONP */
 function renderBlogPosts(data){
@@ -593,7 +631,11 @@ function renderBlogPosts(data){
 }
 //]]>
 </script>
-<script expr:src='&quot;/feeds/posts/default?alt=json-in-script&amp;callback=renderBlogPosts&amp;max-results=10&quot;'/>
+<b:if cond='data:blog.pageType == &quot;static_page&quot;'>
+  <script expr:src='&quot;/feeds/pages/default?alt=json-in-script&amp;callback=renderPageContent&amp;max-results=20&quot;'/>
+<b:else/>
+  <script expr:src='&quot;/feeds/posts/default?alt=json-in-script&amp;callback=renderBlogPosts&amp;max-results=10&quot;'/>
+</b:if>
 
 </body>
 </html>
