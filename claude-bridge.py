@@ -37,7 +37,7 @@ MAX_CONCURRENT_WORKERS = 2
 TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
-DAILY_BUDGET_USD = 5.0
+DAILY_BUDGET_USD = 100.0
 CLAUDE_TIMEOUT = 300
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
@@ -137,6 +137,10 @@ def init_db():
             duration_ms INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     conn.commit()
     try:
@@ -145,6 +149,16 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     return conn
+
+
+def get_setting(key: str, default: str = None) -> str | None:
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
 
 
 # ── 全局状态 ──
@@ -227,6 +241,13 @@ def log_cost(chat_id: str, project: str, cost: float, turns: int, duration_ms: i
     db.commit()
 
 
+def get_budget() -> tuple[bool, float]:
+    """Return (enabled, amount). enabled=False means budget checking is off."""
+    enabled = get_setting("budget_enabled", "1")
+    amount = float(get_setting("budget_amount", str(DAILY_BUDGET_USD)))
+    return enabled == "1", amount
+
+
 def get_daily_cost(chat_id: str) -> float:
     row = db.execute(
         "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_log "
@@ -260,11 +281,14 @@ def make_keyboard(items: list[tuple[str, str]], columns: int = 2,
 
 
 def status_text(active: dict, session: dict | None, daily: float) -> str:
-    cfg = load_config()
     parts = [f"{active['project']}  |  {MODELS.get(active['model'], active['model'])}  |  {active['effort']}"]
     if session:
         parts.append(f"{session['turns']}t  ${session['cost_usd']:.3f}")
-    parts.append(f"Today ${daily:.3f} / ${cfg.get('dailyBudget', DAILY_BUDGET_USD):.1f}")
+    enabled, amount = get_budget()
+    if enabled:
+        parts.append(f"Today ${daily:.3f} / ${amount:.0f}")
+    else:
+        parts.append(f"Today ${daily:.3f} (no limit)")
     return "\n".join(parts)
 
 
@@ -380,11 +404,11 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     daily_cost = get_daily_cost(chat_id_str)
-    cfg = load_config()
-    budget = cfg.get("dailyBudget", DAILY_BUDGET_USD)
-    if daily_cost >= budget:
+    budget_enabled, budget_amount = get_budget()
+    if budget_enabled and daily_cost >= budget_amount:
         await update.message.reply_text(
-            f"Daily budget reached (${daily_cost:.2f} / ${budget:.2f})")
+            f"Daily budget reached (${daily_cost:.2f} / ${budget_amount:.0f}). "
+            f"Use /budget to adjust.")
         return
 
     session = get_session(chat_id_str, active["project"])
@@ -487,6 +511,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     if not text:
+        return
+
+    # Intercept budget amount input
+    if context.user_data.get("awaiting_budget"):
+        del context.user_data["awaiting_budget"]
+        try:
+            amount = float(text)
+            if amount <= 0:
+                raise ValueError
+            set_setting("budget_amount", str(amount))
+            set_setting("budget_enabled", "1")
+            await update.message.reply_text(f"Daily budget set to ${amount:.0f}.")
+        except ValueError:
+            await update.message.reply_text("Invalid amount. Use /budget to try again.")
         return
 
     await _invoke_and_reply(update, context, text)
@@ -666,6 +704,25 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p, c, t in by_project:
             lines.append(f"  {p}: ${c:.4f} ({int(t)}t)")
     await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/budget — 每日预算管理"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id_str = str(update.effective_chat.id)
+    enabled, amount = get_budget()
+    daily_cost = get_daily_cost(chat_id_str)
+    status = "ON" if enabled else "OFF"
+    text = f"Daily Budget: {status}\nLimit: ${amount:.0f}\nUsed today: ${daily_cost:.2f}"
+    items = []
+    if enabled:
+        items.append(("Turn Off", "budget:off"))
+    else:
+        items.append(("Turn On", "budget:on"))
+    items.append(("Set Amount", "budget:set"))
+    kb = make_keyboard(items, columns=2)
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -863,6 +920,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "task_cancel":
         await query.edit_message_text("Task cancelled.")
 
+    # ── budget:<action> ──
+    elif data.startswith("budget:"):
+        action = data.split(":", 1)[1]
+        if action == "off":
+            set_setting("budget_enabled", "0")
+            await query.edit_message_text("Budget checking disabled.")
+        elif action == "on":
+            set_setting("budget_enabled", "1")
+            _, amount = get_budget()
+            await query.edit_message_text(f"Budget checking enabled (${amount:.0f}/day).")
+        elif action == "set":
+            context.user_data["awaiting_budget"] = True
+            await query.edit_message_text("Enter new daily budget amount (e.g. 50, 100):")
+
 
 # ── /task 拦截式编排 ──
 
@@ -889,9 +960,11 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     daily_cost = get_daily_cost(chat_id_str)
-    cfg = load_config()
-    if daily_cost >= cfg.get("dailyBudget", DAILY_BUDGET_USD):
-        await update.message.reply_text("Daily budget reached.")
+    budget_enabled, budget_amount = get_budget()
+    if budget_enabled and daily_cost >= budget_amount:
+        await update.message.reply_text(
+            f"Daily budget reached (${daily_cost:.2f} / ${budget_amount:.0f}). "
+            f"Use /budget to adjust.")
         return
 
     session = get_session(chat_id_str, active["project"])
@@ -960,6 +1033,7 @@ async def post_init(app: Application):
         BotCommand("status", "Status & settings"),
         BotCommand("cost", "Cost summary"),
         BotCommand("task", "Readonly analyze, then execute"),
+        BotCommand("budget", "Daily budget settings"),
         BotCommand("help", "Help"),
     ])
     log.info("Claude Bridge started")
@@ -1003,6 +1077,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("task", cmd_task))
+    app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))

@@ -2,7 +2,7 @@
   "botToken": "<YOUR_TELEGRAM_BOT_TOKEN>",
   "allowFrom": ["<YOUR_TELEGRAM_USER_ID>"],
   "proxy": "http://127.0.0.1:1082",
-  "dailyBudget": 5.0,
+  "dailyBudget": 100.0,
   "defaultModel": "sonnet",
   "defaultToolProfile": "readonly",
   "claudeBin": "~/.local/bin/claude"
