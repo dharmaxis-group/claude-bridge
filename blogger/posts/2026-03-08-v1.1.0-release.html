@@ -1,0 +1,51 @@
+<h2>v1.1.0 Release Notes</h2>
+
+<p>Claude Bridge v1.1.0 brings interactive budget management, two-phase task orchestration, and a critical security fix for tool permissions.</p>
+
+<h3>New: <code>/budget</code> — Runtime Budget Management</h3>
+
+<p>Daily budget is now fully manageable from Telegram — no config file edits, no service restarts.</p>
+
+<pre><code>/budget</code></pre>
+
+<p>Shows current budget status with InlineKeyboard buttons:</p>
+<ul>
+<li><strong>Turn On / Turn Off</strong> — toggle budget enforcement</li>
+<li><strong>Set Amount</strong> — type a number to set a new daily limit (e.g. 50, 200)</li>
+</ul>
+
+<p>Budget settings are persisted to SQLite. Changes take effect immediately on the next message — the bot reads from the database on every request, not from an in-memory constant.</p>
+
+<p>Default budget raised from $5 to $100, reflecting realistic usage with Claude Max subscriptions.</p>
+
+<h3>New: <code>/task</code> — Two-Phase Task Orchestration</h3>
+
+<p>Execute potentially destructive operations safely from your phone:</p>
+
+<ol>
+<li><strong>Phase 1 (readonly):</strong> Claude analyzes the situation using only read tools — no side effects</li>
+<li><strong>Phase 2 (confirm):</strong> Review the analysis in Telegram, then tap [Execute] or [Cancel]</li>
+<li><strong>Phase 3 (execute):</strong> Claude resumes the same session with full tool access</li>
+</ol>
+
+<pre><code>/task Refactor the error handling in claude-bridge.py</code></pre>
+
+<p>You can also reply to any message with <code>/task</code> to use that message as the task description.</p>
+
+<h3>Security Fix: Tool Profiles</h3>
+
+<p>The <code>--allowedTools</code> CLI flag does nothing in <code>claude -p</code> mode. Our <code>readonly</code> profile was completely ineffective — Claude had full tool access regardless of the setting.</p>
+
+<p><strong>Fix:</strong> Switched to <code>--tools</code>, which controls the actual available tool set. Tools not in the list are invisible to Claude.</p>
+
+<h3>Bug Fix: Connection Pool Exhaustion</h3>
+
+<p>Long-running <code>claude -p</code> calls could exhaust the default connection pool (size 1), causing the bot to silently stop responding. Fixed by configuring explicit pool sizes: 16 for main requests, 4 for polling.</p>
+
+<h3>Infrastructure: Sync Checklist</h3>
+
+<p>Added <a href="https://github.com/anthropics/claude-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a> and updated the internal sync checklist to cover external-facing files (README, CHANGELOG, config template) — ensuring documentation stays in sync with code changes.</p>
+
+<hr>
+
+<p>Full changelog: <a href="https://github.com/rssprivacy-commits/claude-bridge/blob/main/CHANGELOG.md">CHANGELOG.md</a></p>

@@ -12,7 +12,8 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 - **Multi-project management** — switch between projects via `/p`. Each project has its own CLAUDE.md, session state, and cost tracking
 - **Session persistence** — SQLite-backed sessions with `--resume` support
 - **Image support** — send photos from Telegram, Claude reads them via the Read tool
-- **Cost tracking** — daily budget limits, per-project cost breakdown, `/cost` command
+- **Cost tracking** — daily budget (configurable via `/budget`), per-project cost breakdown, `/cost` command
+- **`/task` orchestration** — two-phase execution: readonly analysis first, then confirm to execute with full tools
 - **InlineKeyboard UI** — interactive buttons for project selection, model switching, tool permissions
 - **Tool permission profiles** — readonly (default), standard, restricted
 - **LaunchAgent integration** — auto-start on boot, auto-restart on crash (macOS)
@@ -77,7 +78,7 @@ Copy `config.example.json` to `config.json` and fill in your values:
 | `botToken` | string | Telegram Bot API token from @BotFather. Supports Keychain: `"!security find-generic-password -s SERVICE -a ACCOUNT -w"` |
 | `allowFrom` | string[] | Telegram user ID whitelist (find yours via [@userinfobot](https://t.me/userinfobot)) |
 | `proxy` | string | HTTP proxy URL (e.g. `http://127.0.0.1:1082`). Remove if not needed |
-| `dailyBudget` | number | Daily cost limit in USD. Rejects new requests when exceeded |
+| `dailyBudget` | number | Initial daily budget in USD (default: 100). Managed at runtime via `/budget` |
 | `defaultModel` | string | Default model: `opus` or `sonnet` |
 | `defaultToolProfile` | string | Default tool permission: `readonly` / `standard` / `restricted` |
 | `claudeBin` | string | Path to `claude` CLI binary |
@@ -112,6 +113,8 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | `/effort` | Set thinking depth (Low / Medium / High) |
 | `/tools` | Set tool permissions (Readonly / Standard / Restricted) |
 | `/think` | One-key switch to Opus + High effort |
+| `/task <desc>` | Two-phase task: readonly analysis → confirm → execute |
+| `/budget` | Daily budget settings (on/off/set amount) |
 | `/new` | Reset current session |
 | `/cost` | Cost summary (today / 7-day / by project) |
 
@@ -127,18 +130,17 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 
 **readonly** (default) — safe for browsing:
 ```
-Read, Grep, Glob, WebSearch, WebFetch,
-Bash(cat/head/tail/ls/wc/git log/git status/git diff/...)
+Read, Grep, Glob, WebSearch, WebFetch
 ```
 
-**standard** — full access:
+**standard** — full access (all tools, default Claude behavior):
 ```
-Read, Write, Edit, Grep, Glob, WebSearch, WebFetch, Bash
+All tools enabled
 ```
 
 **restricted** — minimal:
 ```
-Read, Grep, Glob, WebSearch, WebFetch
+Read, Grep, Glob
 ```
 
 ## LaunchAgent Setup (macOS)
@@ -205,6 +207,7 @@ SQLite at `~/.claude-bridge/data/sessions.db` (WAL mode):
 - **sessions** — per-project session state (session_id, turns, cost)
 - **active_project** — current project/model/tools per user
 - **cost_log** — cost history for `/cost` reports
+- **settings** — key-value store for runtime config (budget, etc.)
 
 ## License
 
