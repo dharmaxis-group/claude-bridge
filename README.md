@@ -117,6 +117,7 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | `/budget` | Daily budget settings (on/off/set amount) |
 | `/new` | Reset current session |
 | `/cost` | Cost summary (today / 7-day / by project) |
+| `/restart` | Restart CB service (LaunchAgent auto-respawn) |
 
 ### Message Types
 
@@ -126,22 +127,9 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | Image | Downloaded, then Claude reads it via the Read tool |
 | Image + Caption | Image path + caption combined as prompt |
 
-### Tool Permission Profiles
+### Tool Permissions
 
-**readonly** (default) — safe for browsing:
-```
-Read, Grep, Glob, WebSearch, WebFetch
-```
-
-**standard** — full access (all tools, default Claude behavior):
-```
-All tools enabled
-```
-
-**restricted** — minimal:
-```
-Read, Grep, Glob
-```
+As of v1.2.0, Claude has full tool access in all modes. The `/tools` menu remains for future use but `--tools` is no longer passed to the CLI.
 
 ## LaunchAgent Setup (macOS)
 

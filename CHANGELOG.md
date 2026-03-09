@@ -2,7 +2,18 @@
 
 All notable changes to Claude Bridge are documented here.
 
-## [Unreleased]
+## [1.2.0] — 2026-03-10
+
+### Added
+- `/restart` — restart CB service via Telegram (LaunchAgent KeepAlive auto-respawn)
+
+### Changed
+- Removed `--tools` flag from Claude invocation — tool profiles no longer enforced at CLI level; Claude has full tool access in all modes
+- `MAX_TURNS` 15 → 8 (reduce runaway sessions)
+- `CLAUDE_TIMEOUT` 300s → 900s (allow longer operations)
+
+### Fixed
+- **Bootstrap retry loop**: proxy downtime caused 1.5h outage (310 failed restarts). Root cause: `bootstrap_retries=0` (default) exits process on first failure → LaunchAgent blindly respawns → same failure. Fix: `bootstrap_retries=-1` (infinite retry within process)
 
 ## [1.1.0] — 2026-03-08
 
