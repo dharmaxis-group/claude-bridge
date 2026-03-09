@@ -32,13 +32,13 @@ LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
 IMAGE_DIR = CB_HOME / "data" / "images"
 
 DEFAULT_MODEL = "sonnet"
-MAX_TURNS = 15
+MAX_TURNS = 8
 MAX_CONCURRENT_WORKERS = 2
 TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
 DAILY_BUDGET_USD = 100.0
-CLAUDE_TIMEOUT = 300
+CLAUDE_TIMEOUT = 900
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
 
@@ -47,7 +47,7 @@ TOOL_PROFILES = {
     "standard": "default",
     "restricted": "Read,Grep,Glob",
 }
-DEFAULT_TOOL_PROFILE = "readonly"
+DEFAULT_TOOL_PROFILE = "readonly"  # kept for reference; --tools no longer passed to claude
 
 MODELS = {
     "opus": "Opus 4.6",
@@ -304,7 +304,6 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         "--max-turns", str(MAX_TURNS),
         "--model", model,
         "--effort", effort,
-        "--tools", TOOL_PROFILES.get(tool_profile, TOOL_PROFILES["readonly"]),
     ]
     if bypass_permissions:
         cmd.extend(["--permission-mode", "bypassPermissions"])
@@ -1014,6 +1013,19 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id, text="Execute the suggested operations?", reply_markup=kb)
 
 
+# ── /restart ──
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/restart — restart CB service via launchd (KeepAlive auto-respawn)"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    await update.message.reply_text("Restarting CB service...")
+    log.info("Restart requested via /restart command")
+    # Delay exit to let the reply reach Telegram
+    await asyncio.sleep(1)
+    os._exit(0)
+
+
 # ── Error Handler ──
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1034,6 +1046,7 @@ async def post_init(app: Application):
         BotCommand("cost", "Cost summary"),
         BotCommand("task", "Readonly analyze, then execute"),
         BotCommand("budget", "Daily budget settings"),
+        BotCommand("restart", "Restart CB service"),
         BotCommand("help", "Help"),
     ])
     log.info("Claude Bridge started")
@@ -1078,6 +1091,7 @@ def main():
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("budget", cmd_budget))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -1085,7 +1099,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info(f"Starting with proxy={proxy}, allowed={cfg.get('allowFrom', [])}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,
+                     bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
