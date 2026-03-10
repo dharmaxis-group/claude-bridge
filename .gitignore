@@ -13,5 +13,10 @@ kb-content/
 sync-pipeline.py
 CLAUDE.md
 
+# Python bytecode (leaks source paths in .pyc)
+__pycache__/
+*.pyc
+*.pyo
+
 # macOS
 .DS_Store
