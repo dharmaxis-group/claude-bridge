@@ -199,4 +199,4 @@ SQLite at `~/.claude-bridge/data/sessions.db` (WAL mode):
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — Copyright © 2026 [Dharmaxis Group](<removed>)
