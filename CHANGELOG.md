@@ -2,6 +2,15 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.2.1] — 2026-03-11
+
+### Security
+- **Personal path leak purge**: git filter-repo removed 16 instances of personal filesystem paths (`/Users/chenmingzhong/`) from public repository history; force-push rewrote all affected commits
+- Added `__pycache__/`, `*.pyc`, `*.pyo` to `.gitignore` (prevent bytecode leaking source paths)
+
+### Fixed
+- Blog post URL: corrected GitHub repo link from `anthropics/claude-bridge` to `rssprivacy-commits/claude-bridge`
+
 ## [1.2.0] — 2026-03-10
 
 ### Added
