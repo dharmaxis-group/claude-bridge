@@ -338,7 +338,15 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         raw = stdout.decode("utf-8", errors="replace").strip()
         if not raw:
             return {"error": "Claude returned empty output", "result": None}
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # claude CLI --output-format json now returns a JSON array of events;
+        # extract the {"type": "result", ...} element
+        if isinstance(parsed, list):
+            for item in reversed(parsed):
+                if isinstance(item, dict) and item.get("type") == "result":
+                    return item
+            return {"error": "No result event in Claude output", "result": None}
+        return parsed
 
     except json.JSONDecodeError as e:
         log.error(f"JSON parse error: {e}, raw={raw[:200]}")
@@ -1030,6 +1038,18 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error(f"Unhandled exception: {context.error}", exc_info=context.error)
+    # 把错误摘要发回 Telegram，让用户立刻知道
+    if update and hasattr(update, "effective_chat") and update.effective_chat:
+        err_name = type(context.error).__name__
+        err_msg = str(context.error)[:300]
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Bot Error: `{err_name}`\n```\n{err_msg}\n```",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass  # 通知本身失败则放弃，避免死循环
 
 
 # ── 启动 ──
