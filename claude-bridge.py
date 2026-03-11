@@ -630,7 +630,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if result.get("error") and not result.get("result"):
         await update.message.reply_text(f"Error: {result['error'][:500]}")
-        return
+        return None
 
     reply_text = result.get("result", "")
     if not reply_text:
@@ -652,6 +652,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
     log_cost(chat_id_str, active["project"], cost, turns, duration)
     await send_long_message(context.bot, chat_id, reply_text)
+    return result.get("result", "")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -692,8 +693,61 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+TTS_VOICE = "zh-CN-XiaoxiaoNeural"
+TTS_MAX_CHARS = 800  # TTS 文本上限，超长只语音前 800 字
+
+
+async def _send_voice_reply(bot, chat_id: int, text: str):
+    """Convert text to voice via edge-tts → ffmpeg → send_voice."""
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    # Strip markdown/code formatting for cleaner speech
+    clean = re.sub(r'```[\s\S]*?```', '', text)  # remove code blocks
+    clean = re.sub(r'`[^`]+`', '', clean)  # remove inline code
+    clean = re.sub(r'[*_~\[\]()#>]', '', clean).strip()  # remove markdown chars
+    if not clean:
+        return
+    if len(clean) > TTS_MAX_CHARS:
+        clean = clean[:TTS_MAX_CHARS] + "……后续请看文字回复"
+
+    mp3_path = VOICE_DIR / f"tts_{chat_id}_{int(time.time())}.mp3"
+    ogg_path = mp3_path.with_suffix(".ogg")
+
+    try:
+        # edge-tts → MP3
+        proc = await asyncio.create_subprocess_exec(
+            "edge-tts", "--voice", TTS_VOICE, "--text", clean,
+            "--write-media", str(mp3_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0 or not mp3_path.exists():
+            return
+
+        # ffmpeg MP3 → OGG Opus
+        proc2 = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(mp3_path),
+            "-c:a", "libopus", "-b:a", "48k", str(ogg_path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc2.communicate(), timeout=30)
+        if proc2.returncode != 0 or not ogg_path.exists():
+            return
+
+        with open(ogg_path, "rb") as f:
+            await bot.send_voice(chat_id=chat_id, voice=f)
+
+    except Exception as e:
+        log.error(f"TTS failed: {e}")
+    finally:
+        try:
+            mp3_path.unlink(missing_ok=True)
+            ogg_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理语音消息：下载 → Whisper 转录 → 作为 prompt"""
+    """处理语音消息：下载 → Whisper 转录 → Claude → 文字+语音回复"""
     if not update.message or not update.message.voice:
         return
     if not is_allowed(update.effective_chat.id):
@@ -737,7 +791,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(f"🎤 {transcript}")
         log.info(f"voice transcribed: {transcript[:100]}")
-        await _invoke_and_reply(update, context, transcript)
+
+        # Invoke Claude and get reply text
+        reply_text = await _invoke_and_reply(update, context, transcript)
+
+        # Voice reply: convert Claude's response to speech
+        if reply_text:
+            await _send_voice_reply(context.bot, update.effective_chat.id, reply_text)
 
         # Cleanup
         try:
