@@ -2,6 +2,22 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.3.0] — 2026-03-12
+
+### Added
+- **Streaming progress feedback** — real-time tool use progress during Claude operations. Shows which tools Claude is using (Read, Bash, Edit, Search, etc.) instead of blind "typing..." indicator
+- **Voice message support** — send voice messages in Telegram, automatically transcribed via Whisper and sent to Claude as text prompt
+- **Document/file handling** — send PDF, code files, logs, etc. directly in Telegram. Claude reads and analyzes the file content
+- **`/cron` scheduled tasks** — register recurring prompts that run automatically on a schedule. Subcommands: `add`, `list`, `rm`, `pause`, `resume`. Min interval 5 minutes
+- **Error notifications** — unhandled exceptions now send error summary back to Telegram chat instead of silently failing
+
+### Fixed
+- **Claude CLI JSON array format** — adapted `invoke_claude` to handle new `--output-format json` output (JSON array instead of single object). Extracts `type: "result"` event from array
+
+### Changed
+- `send_long_message` refactored to accept `bot` directly (enables cron scheduler to send messages without handler context)
+- Main message flow now uses `stream-json` output format for real-time event processing
+
 ## [1.2.1] — 2026-03-11
 
 ### Security

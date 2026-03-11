@@ -11,8 +11,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,6 +32,7 @@ CONFIG_PATH = CB_HOME / "config.json"
 DB_PATH = CB_HOME / "data" / "sessions.db"
 LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
 IMAGE_DIR = CB_HOME / "data" / "images"
+VOICE_DIR = CB_HOME / "data" / "voice"
 
 DEFAULT_MODEL = "sonnet"
 MAX_TURNS = 8
@@ -39,8 +42,17 @@ SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
 DAILY_BUDGET_USD = 100.0
 CLAUDE_TIMEOUT = 900
+PROGRESS_EDIT_INTERVAL = 3.0  # min seconds between Telegram progress message edits
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
+
+# ── Agent Loop 常量 ──
+AGENT_PHASE_TIMEOUT = 600       # 10 min per phase
+AGENT_PHASE_MAX_TURNS = 50      # Claude inner turns per execute phase
+AGENT_PLAN_MAX_TURNS = 10       # turns for planning
+AGENT_VERIFY_MAX_TURNS = 10     # turns for verification
+AGENT_MAX_COST_USD = 2.0        # total cost budget
+AGENT_MAX_PHASES = 8            # max phases in plan
 
 TOOL_PROFILES = {
     "readonly": "Read,Grep,Glob,WebSearch,WebFetch",
@@ -141,6 +153,18 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS cron_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            interval_sec INTEGER NOT NULL,
+            model TEXT DEFAULT 'sonnet',
+            effort TEXT DEFAULT 'medium',
+            enabled INTEGER DEFAULT 1,
+            last_run TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
     try:
@@ -166,6 +190,7 @@ def set_setting(key: str, value: str):
 db: sqlite3.Connection = None
 user_locks: dict[str, asyncio.Lock] = {}
 worker_semaphore: asyncio.Semaphore = None
+agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
 
 
 def get_user_lock(chat_id: str) -> asyncio.Lock:
@@ -259,6 +284,24 @@ def get_daily_cost(chat_id: str) -> float:
 def list_projects() -> list[dict]:
     rows = db.execute("SELECT name, path, description FROM projects ORDER BY name").fetchall()
     return [{"name": r[0], "path": r[1], "description": r[2]} for r in rows]
+
+
+def _parse_interval(s: str) -> int | None:
+    """Parse '5m', '1h', '6h', '1d' to seconds. Min 5 minutes."""
+    m = re.match(r'^(\d+)(m|h|d)$', s.strip().lower())
+    if not m:
+        return None
+    val, unit = int(m.group(1)), m.group(2)
+    sec = val * {'m': 60, 'h': 3600, 'd': 86400}[unit]
+    return sec if sec >= 300 else None
+
+
+def _format_interval(sec: int) -> str:
+    if sec >= 86400 and sec % 86400 == 0:
+        return f"{sec // 86400}d"
+    if sec >= 3600 and sec % 3600 == 0:
+        return f"{sec // 3600}h"
+    return f"{sec // 60}m"
 
 
 # ── 鉴权 ──
@@ -356,6 +399,119 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         return {"error": str(e), "result": None}
 
 
+def _format_tool_progress(name: str, input_data: dict) -> str:
+    """Format a tool_use event into a concise progress line."""
+    if name == "Read":
+        p = input_data.get("file_path", "")
+        return f"Read {Path(p).name}" if p else "Read"
+    if name == "Bash":
+        cmd = input_data.get("command", "")
+        return f"$ {cmd[:40]}..." if len(cmd) > 40 else f"$ {cmd}"
+    if name in ("Edit", "Write"):
+        p = input_data.get("file_path", "")
+        return f"Edit {Path(p).name}" if p else name
+    if name == "Grep":
+        pat = input_data.get("pattern", "")
+        return f"Search: {pat[:25]}..." if len(pat) > 25 else f"Search: {pat}"
+    if name == "Glob":
+        return f"Find: {input_data.get('pattern', '')[:30]}"
+    if name == "WebSearch":
+        q = input_data.get("query", "")
+        return f"Web: {q[:30]}..." if len(q) > 30 else f"Web: {q}"
+    if name == "WebFetch":
+        url = input_data.get("url", "")
+        return f"Fetch: {url[:30]}..." if len(url) > 30 else f"Fetch: {url}"
+    return name
+
+
+async def invoke_claude_streaming(message: str, project_path: str, session_id: str | None,
+                                   model: str, tool_profile: str, effort: str = "medium",
+                                   bypass_permissions: bool = False,
+                                   on_tool_use=None) -> dict:
+    """Stream claude -p output via stream-json, calling on_tool_use(name, input) for progress.
+    Returns the final result dict (same schema as invoke_claude)."""
+    claude_bin = get_claude_bin()
+    cmd = [
+        str(claude_bin), "-p",
+        "--output-format", "stream-json",
+        "--max-turns", str(MAX_TURNS),
+        "--model", model,
+        "--effort", effort,
+    ]
+    if bypass_permissions:
+        cmd.extend(["--permission-mode", "bypassPermissions"])
+    if session_id:
+        cmd.extend(["--resume", session_id])
+
+    log.info(f"invoke_stream: model={model} effort={effort} project={project_path} resume={session_id is not None}")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_path,
+            env=CLAUDE_ENV,
+        )
+        proc.stdin.write(message.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+
+        result = {"error": "No result received", "result": None}
+        deadline = time.monotonic() + CLAUDE_TIMEOUT
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                await proc.wait()
+                return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
+
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, 30))
+            except asyncio.TimeoutError:
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    await proc.wait()
+                    return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
+                continue
+
+            if not line:
+                break
+
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+
+            try:
+                event = json.loads(line_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type", "")
+            if etype == "result":
+                result = event
+            elif etype == "assistant" and on_tool_use:
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use":
+                        await on_tool_use(block.get("name", ""), block.get("input", {}))
+
+        await proc.wait()
+
+        if proc.returncode != 0 and not result.get("result"):
+            stderr_data = await proc.stderr.read()
+            err = stderr_data.decode("utf-8", errors="replace").strip()
+            log.error(f"claude exit {proc.returncode}: {err}")
+            return {"error": f"Claude exit {proc.returncode}: {err[:200]}", "result": None}
+
+        return result
+
+    except Exception as e:
+        log.error(f"invoke_stream error: {e}")
+        return {"error": str(e), "result": None}
+
+
 # ── Telegram 消息处理 ──
 
 async def send_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event):
@@ -370,7 +526,8 @@ async def send_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, sto
             pass
 
 
-async def send_long_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+async def send_long_message(bot, chat_id: int, text: str):
+    """Split and send a long message. Accepts Bot instance directly."""
     chunks = []
     while len(text) > TELEGRAM_MAX_LEN:
         split_pos = text.rfind("\n", 0, TELEGRAM_MAX_LEN)
@@ -384,11 +541,11 @@ async def send_long_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, te
         if not chunk.strip():
             continue
         try:
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=chunk)
+            await bot.send_message(chat_id=chat_id, text=chunk)
 
 
 async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -428,23 +585,48 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb,
         )
 
+    # Progress message for streaming feedback
+    progress_msg = await update.message.reply_text("Working...")
+    progress_lines = []
+    last_edit = 0.0
+
+    async def on_tool_use(tool_name: str, tool_input: dict):
+        nonlocal last_edit
+        progress_lines.append(_format_tool_progress(tool_name, tool_input))
+        now = time.monotonic()
+        if now - last_edit >= PROGRESS_EDIT_INTERVAL:
+            last_edit = now
+            display = progress_lines[-6:]
+            progress_text = "Working...\n" + "\n".join(f"`> {l}`" for l in display)
+            try:
+                await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
     lock = get_user_lock(chat_id_str)
     async with lock:
         async with worker_semaphore:
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
             try:
-                result = await invoke_claude(
+                result = await invoke_claude_streaming(
                     message=text,
                     project_path=active["path"],
                     session_id=session_id,
                     model=active["model"],
                     tool_profile=active["tool_profile"],
                     effort=active["effort"],
+                    on_tool_use=on_tool_use,
                 )
             finally:
                 stop_typing.set()
                 await typing_task
+
+    # Clean up progress message
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
 
     if result.get("error") and not result.get("result"):
         await update.message.reply_text(f"Error: {result['error'][:500]}")
@@ -469,7 +651,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
     log_cost(chat_id_str, active["project"], cost, turns, duration)
-    await send_long_message(context, chat_id, reply_text)
+    await send_long_message(context.bot, chat_id, reply_text)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,6 +688,116 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error(f"handle_photo failed: {e}", exc_info=True)
         try:
             await update.message.reply_text(f"Image processing failed: {e}")
+        except Exception:
+            pass
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理语音消息：下载 → Whisper 转录 → 作为 prompt"""
+    if not update.message or not update.message.voice:
+        return
+    if not is_allowed(update.effective_chat.id):
+        return
+
+    try:
+        voice = update.message.voice
+        VOICE_DIR.mkdir(parents=True, exist_ok=True)
+
+        file = await context.bot.get_file(voice.file_id)
+        voice_path = VOICE_DIR / f"{voice.file_unique_id}.ogg"
+        await file.download_to_drive(str(voice_path))
+        log.info(f"voice downloaded: {voice_path} ({voice.duration}s)")
+
+        status_msg = await update.message.reply_text("Transcribing...")
+        proc = await asyncio.create_subprocess_exec(
+            "whisper", str(voice_path),
+            "--model", "base",
+            "--output_format", "txt",
+            "--output_dir", str(VOICE_DIR),
+            "--language", "zh",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace")[:200]
+            await status_msg.edit_text(f"Transcription failed: {err}")
+            return
+
+        txt_path = voice_path.with_suffix(".txt")
+        if not txt_path.exists():
+            await status_msg.edit_text("Transcription produced no output")
+            return
+
+        transcript = txt_path.read_text().strip()
+        if not transcript:
+            await status_msg.edit_text("Empty transcription (audio too quiet?)")
+            return
+
+        await status_msg.edit_text(f"🎤 {transcript}")
+        log.info(f"voice transcribed: {transcript[:100]}")
+        await _invoke_and_reply(update, context, transcript)
+
+        # Cleanup
+        try:
+            voice_path.unlink(missing_ok=True)
+            txt_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Transcription timed out")
+    except Exception as e:
+        log.error(f"handle_voice failed: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"Voice processing failed: {e}")
+        except Exception:
+            pass
+
+
+DOCUMENT_DIR = CB_HOME / "data" / "documents"
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理文档消息：下载文件 → 构造 prompt → Claude Read"""
+    if not update.message or not update.message.document:
+        return
+    if not is_allowed(update.effective_chat.id):
+        return
+
+    try:
+        doc = update.message.document
+        caption = (update.message.caption or "").strip()
+        file_name = doc.file_name or "unknown"
+
+        # 20MB Telegram bot API limit
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            await update.message.reply_text(f"File too large ({doc.file_size // 1024 // 1024}MB). Max 20MB.")
+            return
+
+        DOCUMENT_DIR.mkdir(parents=True, exist_ok=True)
+        file = await context.bot.get_file(doc.file_id)
+        doc_path = DOCUMENT_DIR / f"{doc.file_unique_id}_{file_name}"
+        await file.download_to_drive(str(doc_path))
+        log.info(f"document downloaded: {doc_path} ({doc.file_size} bytes)")
+
+        prompt = f"I'm sending you a file: {file_name}\nUse the Read tool to view the file at {doc_path} first, then respond."
+        if caption:
+            prompt += f"\n\nUser message: {caption}"
+        else:
+            prompt += "\n\nAnalyze this file and summarize what you see."
+
+        await _invoke_and_reply(update, context, prompt)
+
+        try:
+            doc_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.error(f"handle_document failed: {e}", exc_info=True)
+        try:
+            await update.message.reply_text(f"Document processing failed: {e}")
         except Exception:
             pass
 
@@ -922,7 +1214,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_cost(chat_id_str, active["project"], cost, turns, duration)
         reply = result.get("result", "") or "(no output)"
         cost_tag = f"\n\n`standard | {active['model']} | ${cost:.4f} | {duration/1000:.1f}s`"
-        await send_long_message(context, chat_id, reply + cost_tag)
+        await send_long_message(context.bot, chat_id, reply + cost_tag)
 
     elif data == "task_cancel":
         await query.edit_message_text("Task cancelled.")
@@ -1016,9 +1308,347 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Execute", callback_data=f"task_exec:{new_session_id}"),
          InlineKeyboardButton("Cancel", callback_data="task_cancel")],
     ])
-    await send_long_message(context, chat_id, analysis + cost_tag)
+    await send_long_message(context.bot, chat_id, analysis + cost_tag)
     await context.bot.send_message(
         chat_id=chat_id, text="Execute the suggested operations?", reply_markup=kb)
+
+
+# ── Agent Loop ──
+
+def _extract_json(text: str) -> dict | None:
+    """Extract first JSON object from Claude's text response."""
+    m = re.search(r'```(?:json)?\s*(\{.+?\})\s*```', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+async def _agent_invoke(message: str, project_path: str, session_id: str | None,
+                        model: str, tool_profile: str, effort: str = "high",
+                        max_turns: int = 50, timeout: int = 600) -> dict:
+    """Claude invocation with agent-specific limits. Uses stdin + JSON array parsing."""
+    claude_bin = get_claude_bin()
+    cmd = [
+        str(claude_bin), "-p",
+        "--output-format", "json",
+        "--max-turns", str(max_turns),
+        "--model", model,
+        "--effort", effort,
+    ]
+    # Agent execute phases with standard profile get bypassPermissions
+    if tool_profile == "standard":
+        cmd.extend(["--permission-mode", "bypassPermissions"])
+    if session_id:
+        cmd.extend(["--resume", session_id])
+
+    log.info(f"agent_invoke: model={model} tp={tool_profile} max_turns={max_turns} "
+             f"resume={bool(session_id)}")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_path,
+            env=CLAUDE_ENV,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=message.encode("utf-8")), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {"error": f"Timeout ({timeout}s)", "result": None}
+
+        if proc.returncode != 0:
+            err = stderr.decode("utf-8", errors="replace").strip()
+            return {"error": f"Exit {proc.returncode}: {err[:300]}", "result": None}
+
+        raw = stdout.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return {"error": "Empty output", "result": None}
+
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            for item in reversed(parsed):
+                if isinstance(item, dict) and item.get("type") == "result":
+                    return item
+            return {"error": "No result event in output", "result": None}
+        return parsed
+
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parse: {e}", "result": raw[:500] if raw else None}
+    except Exception as e:
+        log.error(f"agent_invoke error: {e}")
+        return {"error": str(e), "result": None}
+
+
+async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
+                         objective: str, context: ContextTypes.DEFAULT_TYPE):
+    """Core agent: Plan → Execute phases → Verify."""
+    chat_id = int(chat_id_str)
+    cancel = agent_running.get(chat_id_str, {}).get("cancel")
+    total_cost = 0.0
+    total_turns = 0
+    phase_results = []
+
+    try:
+        # ── PLAN ──
+        await context.bot.send_message(
+            chat_id=chat_id, text="🎯 *Agent 启动*\n目标: " + objective + "\n\n规划中...",
+            parse_mode=ParseMode.MARKDOWN)
+
+        plan_prompt = (
+            "你是任务规划专家。分析目标，输出 JSON 执行计划。\n\n"
+            f"目标：{objective}\n\n"
+            "可用工具：文件读写(Read/Write/Edit)、搜索(Grep/Glob)、"
+            "终端(Bash)、网络搜索(WebSearch)、网页抓取(WebFetch)\n\n"
+            "严格输出以下 JSON（无其他文本）：\n"
+            "```json\n"
+            '{"phases": [{"id": 1, "title": "标题", '
+            '"objective": "具体目标", '
+            '"tool_profile": "readonly或standard", '
+            '"estimated_turns": 10}], '
+            '"summary": "一句话计划摘要"}\n'
+            "```\n\n"
+            "规则：最多5个phase | 只有修改文件才用standard | estimated_turns合计≤50"
+        )
+
+        plan_result = await _agent_invoke(
+            plan_prompt, project_path, None, model, "readonly",
+            effort="high", max_turns=AGENT_PLAN_MAX_TURNS, timeout=120)
+
+        if plan_result.get("error"):
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"❌ 规划失败: {plan_result['error'][:300]}")
+            return
+
+        total_cost += plan_result.get("total_cost_usd", 0)
+        total_turns += plan_result.get("num_turns", 0)
+
+        plan_text = plan_result.get("result", "")
+        plan = _extract_json(plan_text)
+
+        if not plan or "phases" not in plan:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"❌ 无法解析计划\n\n{str(plan_text)[:500]}")
+            return
+
+        phases = plan["phases"][:AGENT_MAX_PHASES]
+        summary = plan.get("summary", "")
+
+        plan_lines = ["📋 *计划* (" + str(len(phases)) + " 阶段): " + summary + "\n"]
+        for p in phases:
+            tp_tag = "📝" if p.get("tool_profile") == "standard" else "👁"
+            plan_lines.append(f"  {p['id']}. {tp_tag} {p['title']}")
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text="\n".join(plan_lines),
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id, text="\n".join(plan_lines))
+
+        # ── EXECUTE ──
+        session_id = None
+
+        for i, phase in enumerate(phases):
+            if cancel and cancel.is_set():
+                await context.bot.send_message(chat_id=chat_id, text="⏹ Agent 已停止")
+                return
+
+            if total_cost >= AGENT_MAX_COST_USD:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ 成本上限 ${AGENT_MAX_COST_USD}，已停止 ({i}/{len(phases)})")
+                break
+
+            phase_num = i + 1
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚡ Phase {phase_num}/{len(phases)}: {phase['title']}")
+
+            exec_prompt = (
+                f"执行多步任务的第 {phase_num}/{len(phases)} 阶段。\n\n"
+                f"整体目标：{objective}\n"
+                f"当前阶段：{phase['title']}\n"
+                f"阶段目标：{phase['objective']}\n\n"
+                "立即开始执行。完成后简要说明完成了什么、产出物路径（如有）。"
+            )
+
+            tp = phase.get("tool_profile", "readonly")
+            if tp not in TOOL_PROFILES:
+                tp = "readonly"
+            est = phase.get("estimated_turns", 20)
+
+            exec_result = await _agent_invoke(
+                exec_prompt, project_path, session_id, model, tp,
+                effort="high",
+                max_turns=min(est * 2, AGENT_PHASE_MAX_TURNS),
+                timeout=AGENT_PHASE_TIMEOUT)
+
+            if exec_result.get("error"):
+                phase_results.append({
+                    "phase": phase_num, "title": phase["title"],
+                    "status": "failed", "error": exec_result["error"][:200]})
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Phase {phase_num} 失败: {exec_result['error'][:200]}")
+                continue
+
+            session_id = exec_result.get("session_id", session_id)
+            cost = exec_result.get("total_cost_usd", 0)
+            turns = exec_result.get("num_turns", 0)
+            total_cost += cost
+            total_turns += turns
+
+            result_text = exec_result.get("result", "")
+            phase_results.append({
+                "phase": phase_num, "title": phase["title"],
+                "status": "done", "summary": result_text[:300]})
+
+            short = result_text[:500] + "..." if len(result_text) > 500 else result_text
+            await send_long_message(
+                context.bot, chat_id,
+                f"✅ Phase {phase_num} 完成 (${cost:.4f}, {turns}t)\n\n{short}")
+
+        # ── VERIFY (独立 session，不受执行上下文污染) ──
+        if cancel and cancel.is_set():
+            return
+
+        if phase_results:
+            await context.bot.send_message(chat_id=chat_id, text="🔍 独立验证中...")
+
+            results_summary = "\n".join([
+                f"Phase {r['phase']} ({r['title']}): {r['status']}"
+                + (f" - {r.get('summary', '')[:100]}" if r['status'] == 'done'
+                   else f" - {r.get('error', '')}")
+                for r in phase_results
+            ])
+
+            verify_prompt = (
+                "你是独立审查员。评估任务执行结果。\n\n"
+                f"原始目标：{objective}\n"
+                f"计划摘要：{summary}\n"
+                f"各阶段结果：\n{results_summary}\n\n"
+                "评估：1. 目标达成度(pass/partial/fail) "
+                "2. 质量(1-5) 3. 遗漏 4. 最终摘要（一段话）"
+            )
+
+            verify_result = await _agent_invoke(
+                verify_prompt, project_path, None, model, "readonly",
+                effort="medium", max_turns=AGENT_VERIFY_MAX_TURNS, timeout=120)
+
+            total_cost += verify_result.get("total_cost_usd", 0)
+            total_turns += verify_result.get("num_turns", 0)
+            verify_text = verify_result.get("result", "(验证无输出)")
+        else:
+            verify_text = "(无阶段完成，跳过验证)"
+
+        # ── FINAL REPORT ──
+        done_count = len([r for r in phase_results if r['status'] == 'done'])
+        final = (
+            "🏁 *Agent 完成*\n\n"
+            f"目标: {objective}\n"
+            f"阶段: {done_count}/{len(phases)} 成功\n"
+            f"总计: ${total_cost:.4f}, {total_turns} turns\n\n"
+            f"验证:\n{verify_text}")
+
+        await send_long_message(context.bot, chat_id, final)
+        log_cost(chat_id_str, "agent", total_cost, total_turns, 0)
+
+    except asyncio.CancelledError:
+        await context.bot.send_message(chat_id=chat_id, text="⏹ Agent 已取消")
+    except Exception as e:
+        log.error(f"Agent loop error: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"❌ Agent 错误: {str(e)[:300]}")
+        except Exception:
+            pass
+    finally:
+        agent_running.pop(chat_id_str, None)
+
+
+async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/agent <objective> | stop | status"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id_str = str(update.effective_chat.id)
+    args = context.args or []
+
+    if args and args[0].lower() == "stop":
+        running = agent_running.get(chat_id_str)
+        if running:
+            running["cancel"].set()
+            await update.message.reply_text("⏹ 正在停止 Agent...")
+        else:
+            await update.message.reply_text("没有运行中的 Agent")
+        return
+
+    if args and args[0].lower() == "status":
+        running = agent_running.get(chat_id_str)
+        if running:
+            elapsed = int(time.time() - running["started"])
+            await update.message.reply_text(
+                f"🔄 Agent 运行中 ({elapsed}s)\n目标: {running['objective']}")
+        else:
+            await update.message.reply_text("没有运行中的 Agent")
+        return
+
+    if chat_id_str in agent_running:
+        await update.message.reply_text("⚠️ Agent 已在运行，/agent stop 先停止")
+        return
+
+    objective = " ".join(args).strip()
+    if not objective:
+        await update.message.reply_text(
+            "用法: /agent <目标>\n\n"
+            "示例:\n"
+            "/agent 调研 X 上 Claude Code 最新讨论并写报告\n"
+            "/agent 扫描所有 LaunchAgent 生成健康报告\n\n"
+            "/agent status — 查看进度\n"
+            "/agent stop — 停止")
+        return
+
+    active = get_active_project(chat_id_str)
+    if not active:
+        await update.message.reply_text("先用 /p 选择项目")
+        return
+
+    daily_cost = get_daily_cost(chat_id_str)
+    budget_enabled, budget_amount = get_budget()
+    if budget_enabled and daily_cost >= budget_amount:
+        await update.message.reply_text(f"每日预算已满 ${daily_cost:.2f}")
+        return
+
+    cancel_event = asyncio.Event()
+    agent_running[chat_id_str] = {
+        "cancel": cancel_event,
+        "objective": objective,
+        "started": time.time(),
+    }
+
+    asyncio.create_task(
+        run_agent_loop(chat_id_str, active["path"], "opus", objective, context))
 
 
 # ── /restart ──
@@ -1032,6 +1662,160 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Delay exit to let the reply reach Telegram
     await asyncio.sleep(1)
     os._exit(0)
+
+
+# ── /cron 定时任务 ──
+
+async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cron — 管理定时任务"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id_str = str(update.effective_chat.id)
+    args = context.args or []
+
+    if not args or args[0] == "list":
+        rows = db.execute(
+            "SELECT id, project, prompt, interval_sec, enabled FROM cron_jobs WHERE chat_id=?",
+            (chat_id_str,)
+        ).fetchall()
+        if not rows:
+            await update.message.reply_text(
+                "No cron jobs.\n\n"
+                "Usage:\n"
+                "`/cron add <interval> <prompt>`\n"
+                "`/cron rm <id>`\n"
+                "`/cron pause <id>` / `/cron resume <id>`\n\n"
+                "Intervals: 5m, 30m, 1h, 6h, 1d",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        lines = []
+        for r in rows:
+            status = "ON" if r[4] else "OFF"
+            lines.append(f"#{r[0]} [{status}] {r[1]} | every {_format_interval(r[3])}\n  `{r[2][:60]}`")
+        await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    elif args[0] == "add" and len(args) >= 3:
+        interval = _parse_interval(args[1])
+        if not interval:
+            await update.message.reply_text("Invalid interval (min 5m). Examples: 5m, 1h, 6h, 1d")
+            return
+        prompt = " ".join(args[2:])
+        active = get_active_project(chat_id_str)
+        if not active:
+            await update.message.reply_text("No active project. Use /p first.")
+            return
+        db.execute(
+            "INSERT INTO cron_jobs (chat_id, project, prompt, interval_sec, model, effort) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id_str, active["project"], prompt, interval, active["model"], active["effort"]),
+        )
+        db.commit()
+        job_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        await update.message.reply_text(
+            f"Cron #{job_id} added: every {_format_interval(interval)} on `{active['project']}`\n`{prompt}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif args[0] == "rm" and len(args) >= 2:
+        try:
+            job_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Usage: /cron rm <id>")
+            return
+        deleted = db.execute(
+            "DELETE FROM cron_jobs WHERE id=? AND chat_id=?", (job_id, chat_id_str)
+        ).rowcount
+        db.commit()
+        await update.message.reply_text(f"Cron #{job_id} {'deleted' if deleted else 'not found'}.")
+
+    elif args[0] == "pause" and len(args) >= 2:
+        try:
+            job_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Usage: /cron pause <id>")
+            return
+        db.execute("UPDATE cron_jobs SET enabled=0 WHERE id=? AND chat_id=?", (job_id, chat_id_str))
+        db.commit()
+        await update.message.reply_text(f"Cron #{job_id} paused.")
+
+    elif args[0] == "resume" and len(args) >= 2:
+        try:
+            job_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Usage: /cron resume <id>")
+            return
+        db.execute("UPDATE cron_jobs SET enabled=1 WHERE id=? AND chat_id=?", (job_id, chat_id_str))
+        db.commit()
+        await update.message.reply_text(f"Cron #{job_id} resumed.")
+
+    else:
+        await update.message.reply_text(
+            "Usage:\n"
+            "`/cron add <interval> <prompt>`\n"
+            "`/cron list`\n"
+            "`/cron rm <id>`\n"
+            "`/cron pause <id>` / `/cron resume <id>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def _cron_scheduler(bot):
+    """Background task: check and run due cron jobs every 60s."""
+    await asyncio.sleep(10)  # initial delay after startup
+    while True:
+        try:
+            rows = db.execute(
+                "SELECT id, chat_id, project, prompt, interval_sec, model, effort, last_run "
+                "FROM cron_jobs WHERE enabled=1"
+            ).fetchall()
+
+            for job_id, chat_id, project, prompt, interval_sec, model, effort, last_run in rows:
+                # Check if due
+                if last_run:
+                    row = db.execute(
+                        "SELECT datetime(?, '+' || ? || ' seconds') <= datetime('now')",
+                        (last_run, interval_sec)
+                    ).fetchone()
+                    if not row or not row[0]:
+                        continue
+
+                project_row = db.execute("SELECT path FROM projects WHERE name=?", (project,)).fetchone()
+                if not project_row or not Path(project_row[0]).exists():
+                    continue
+
+                # Mark as running
+                db.execute("UPDATE cron_jobs SET last_run=datetime('now') WHERE id=?", (job_id,))
+                db.commit()
+
+                log.info(f"cron #{job_id} running: {prompt[:50]}")
+                result = await invoke_claude(
+                    message=prompt,
+                    project_path=project_row[0],
+                    session_id=None,
+                    model=model,
+                    tool_profile="readonly",
+                    effort=effort,
+                )
+
+                reply = result.get("result", "") or result.get("error", "No output")
+                cost = result.get("total_cost_usd", 0.0)
+                duration = result.get("duration_ms", 0)
+                header = f"*Cron #{job_id}* (`{_format_interval(interval_sec)}`)\n\n"
+                cost_tag = f"\n\n`cron | {model} | {effort} | ${cost:.4f} | {duration/1000:.1f}s`"
+
+                try:
+                    await send_long_message(bot, int(chat_id), header + reply + cost_tag)
+                except Exception as e:
+                    log.error(f"cron #{job_id} send failed: {e}")
+
+                if cost > 0:
+                    log_cost(chat_id, project, cost, result.get("num_turns", 1), duration)
+
+        except Exception as e:
+            log.error(f"cron scheduler error: {e}", exc_info=True)
+
+        await asyncio.sleep(60)
 
 
 # ── Error Handler ──
@@ -1067,8 +1851,12 @@ async def post_init(app: Application):
         BotCommand("task", "Readonly analyze, then execute"),
         BotCommand("budget", "Daily budget settings"),
         BotCommand("restart", "Restart CB service"),
+        BotCommand("agent", "Autonomous agent loop"),
+        BotCommand("cron", "Scheduled tasks"),
         BotCommand("help", "Help"),
     ])
+    # Start cron scheduler background task
+    asyncio.create_task(_cron_scheduler(app.bot))
     log.info("Claude Bridge started")
 
 
@@ -1112,10 +1900,14 @@ def main():
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("cron", cmd_cron))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info(f"Starting with proxy={proxy}, allowed={cfg.get('allowFrom', [])}")
