@@ -211,6 +211,7 @@ user_locks: dict[str, asyncio.Lock] = {}
 worker_semaphore: asyncio.Semaphore = None
 agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
 _sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
+_background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 
 # ── 敏感信息防护 ──
 
@@ -261,6 +262,28 @@ def get_user_lock(chat_id: str) -> asyncio.Lock:
     if chat_id not in user_locks:
         user_locks[chat_id] = asyncio.Lock()
     return user_locks[chat_id]
+
+
+def _create_background_task(coro, *, name: str = None) -> asyncio.Task:
+    """Create a background task with strong reference to prevent GC destruction."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _safe_result(result) -> dict:
+    """Ensure invoke result is always a dict, guarding against unexpected types."""
+    if isinstance(result, dict):
+        return result
+    log.warning(f"invoke returned non-dict type: {type(result).__name__}")
+    if isinstance(result, list):
+        # Try to find a result event in the list
+        for item in reversed(result):
+            if isinstance(item, dict) and item.get("type") == "result":
+                return item
+        return {"error": "Unexpected list response from Claude", "result": None}
+    return {"error": f"Unexpected {type(result).__name__} response", "result": None}
 
 
 # ── 数据库操作 ──
@@ -517,7 +540,6 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
             stderr=asyncio.subprocess.PIPE,
             cwd=project_path,
             env=CLAUDE_ENV,
-            limit=4 * 1024 * 1024,  # 4MB line buffer (default 64KB too small for large tool results)
         )
         proc.stdin.write(message.encode("utf-8"))
         await proc.stdin.drain()
@@ -525,6 +547,10 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
 
         result = {"error": "No result received", "result": None}
         deadline = time.monotonic() + CLAUDE_TIMEOUT
+        # Manual line buffer — immune to asyncio's StreamReader limit.
+        # readline() raises ValueError when a single line exceeds `limit`;
+        # reading raw chunks and splitting on \n avoids this entirely.
+        buf = b""
 
         while True:
             remaining = deadline - time.monotonic()
@@ -534,7 +560,8 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
                 return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
 
             try:
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, 30))
+                chunk = await asyncio.wait_for(
+                    proc.stdout.read(256 * 1024), timeout=min(remaining, 30))
             except asyncio.TimeoutError:
                 if time.monotonic() >= deadline:
                     proc.kill()
@@ -542,25 +569,40 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
                     return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
                 continue
 
-            if not line:
+            if not chunk:
+                # EOF — process remaining buffer
+                if buf:
+                    line_str = buf.decode("utf-8", errors="replace").strip()
+                    buf = b""
+                    if line_str:
+                        try:
+                            event = json.loads(line_str)
+                            if isinstance(event, dict) and event.get("type") == "result":
+                                result = event
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
                 break
 
-            line_str = line.decode("utf-8", errors="replace").strip()
-            if not line_str:
-                continue
-
-            try:
-                event = json.loads(line_str)
-            except json.JSONDecodeError:
-                continue
-
-            etype = event.get("type", "")
-            if etype == "result":
-                result = event
-            elif etype == "assistant" and on_tool_use:
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_use":
-                        await on_tool_use(block.get("name", ""), block.get("input", {}))
+            buf += chunk
+            # Split on newlines, process complete lines
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+                try:
+                    event = json.loads(line_str)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                etype = event.get("type", "")
+                if etype == "result":
+                    result = event
+                elif etype == "assistant" and on_tool_use:
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_use":
+                            await on_tool_use(block.get("name", ""), block.get("input", {}))
 
         await proc.wait()
 
@@ -807,6 +849,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 stop_typing.set()
                 await typing_task
 
+    result = _safe_result(result)
     if result.get("error") and not result.get("result"):
         try:
             await progress_msg.delete()
@@ -895,11 +938,29 @@ EDGE_TTS_VOICES = {
     "Xiaoni": "zh-CN-shaanxi-XiaoniNeural",
 }
 ELEVENLABS_VOICES = {
-    "Sarah": "EXAVITQu4vr4xnSDxMaL",
-    "George": "JBFqnCBsd6RMkjVDRZzb",
-    "Brian": "nPczCjzI2devNBz1zQrb",
-    "Jessica": "cgSgspJ2msm6clMCkdW9",
-    "Adam": "pNInz6obpgDQGcFmaJgB",
+    # Female
+    "Sarah": "EXAVITQu4vr4xnSDxMaL",       # Mature, Reassuring
+    "Jessica": "cgSgspJ2msm6clMCkdW9",      # Playful, Bright
+    "Laura": "FGY2WhTYpPnrIDTdsKH5",        # Enthusiast, Quirky
+    "Alice": "Xb7hH8MSUJpSbSDYk0k2",        # Clear, Educator
+    "Matilda": "XrExE9yKIg1WjnnlVkGX",      # Professional
+    "Bella": "hpp4J3VqNfWAUOO0d1Us",         # Professional, Bright
+    "Lily": "pFZP5JQG7iQjIQuC4Bku",         # Velvety Actress
+    "River": "SAz9YHcvj6GT2YYXdXww",        # Relaxed, Neutral
+    # Male
+    "George": "JBFqnCBsd6RMkjVDRZzb",       # Warm Storyteller
+    "Brian": "nPczCjzI2devNBz1zQrb",        # Deep, Comforting
+    "Adam": "pNInz6obpgDQGcFmaJgB",         # Dominant, Firm
+    "Charlie": "IKne3meq5aSn9XLyUdCD",      # Deep, Confident
+    "Roger": "CwhRBWXzGAHq8TQ4Fs17",        # Laid-Back, Casual
+    "Callum": "N2lVS1w4EtoT3dr4eOWO",       # Husky Trickster
+    "Harry": "SOYHLrjzK2X1ezoPC6cr",        # Fierce Warrior
+    "Liam": "TX3LPaxmHKxFdv7VOQHJ",        # Energetic
+    "Will": "bIHbv24MWmeRgasZH58o",         # Relaxed Optimist
+    "Eric": "cjVigY5qzO86Huf0OWal",         # Smooth, Trustworthy
+    "Chris": "iP95p4xoKVk53GoZ742B",        # Charming
+    "Daniel": "onwK4e9ZLuTAKqWW03F9",       # Steady Broadcaster
+    "Bill": "pqHfZKP75CvOlQylNhV4",         # Wise, Mature
 }
 ELEVENLABS_MODEL = "eleven_v3"
 
@@ -1344,6 +1405,52 @@ def _voice_panel_kb(vs: dict):
     return make_keyboard(items, columns=2)
 
 
+async def cmd_el(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/el — ElevenLabs account management"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    import httpx
+    api_key = _get_elevenlabs_key()
+    if not api_key:
+        await update.message.reply_text("ElevenLabs API key not found in Keychain.")
+        return
+    try:
+        async with httpx.AsyncClient(proxy="http://127.0.0.1:1082", timeout=15) as client:
+            resp = await client.get(
+                "https://api.elevenlabs.io/v1/user/subscription",
+                headers={"xi-api-key": api_key},
+            )
+        if resp.status_code != 200:
+            await update.message.reply_text(f"API error: {resp.status_code}")
+            return
+        sub = resp.json()
+        used = sub.get("character_count", 0)
+        limit = sub.get("character_limit", 0)
+        pct = (used / limit * 100) if limit else 0
+        reset_ts = sub.get("next_character_count_reset_unix", 0)
+        from datetime import datetime, timezone, timedelta
+        tz8 = timezone(timedelta(hours=8))
+        reset_str = datetime.fromtimestamp(reset_ts, tz=tz8).strftime("%Y-%m-%d") if reset_ts else "N/A"
+        voice_used = sub.get("voice_slots_used", 0)
+        voice_limit = sub.get("voice_limit", 0)
+        pro_limit = sub.get("professional_voice_limit", 0)
+        inv = sub.get("next_invoice", {})
+        next_amount = inv.get("amount_due_cents", 0) / 100
+        status_icon = "✅" if sub.get("status") == "active" else "⚠️"
+        text = (
+            f"*ElevenLabs {sub.get('tier', 'unknown').title()}* {status_icon}\n\n"
+            f"Credits: `{used:,}` / `{limit:,}` ({pct:.1f}%)\n"
+            f"Reset: {reset_str}\n"
+            f"Voice slots: {voice_used} / {voice_limit} (Pro: {pro_limit})\n"
+            f"Clone: {'✅ Instant + Pro' if sub.get('can_use_professional_voice_cloning') else '✅ Instant' if sub.get('can_use_instant_voice_cloning') else '❌'}\n"
+            f"Next bill: ${next_amount:.2f}"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.error(f"cmd_el failed: {e}")
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/voice — 语音回复设置"""
     if not is_allowed(update.effective_chat.id):
@@ -1628,6 +1735,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 finally:
                     stop_typing.set()
                     await typing_task
+        result = _safe_result(result)
         if result.get("error") and not result.get("result"):
             await context.bot.send_message(
                 chat_id=chat_id, text=f"Error: {result['error'][:500]}")
@@ -1714,6 +1822,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stop_typing.set()
                 await typing_task
 
+    result = _safe_result(result)
     if result.get("error") and not result.get("result"):
         await update.message.reply_text(f"Error: {result['error'][:500]}")
         return
@@ -1858,9 +1967,9 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
             "规则：最多5个phase | 只有修改文件才用standard | estimated_turns合计≤50"
         )
 
-        plan_result = await _agent_invoke(
+        plan_result = _safe_result(await _agent_invoke(
             plan_prompt, project_path, None, model, "readonly",
-            effort="high", max_turns=AGENT_PLAN_MAX_TURNS, timeout=120)
+            effort="high", max_turns=AGENT_PLAN_MAX_TURNS, timeout=120))
 
         if plan_result.get("error"):
             await context.bot.send_message(
@@ -1925,11 +2034,11 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
                 tp = "readonly"
             est = phase.get("estimated_turns", 20)
 
-            exec_result = await _agent_invoke(
+            exec_result = _safe_result(await _agent_invoke(
                 exec_prompt, project_path, session_id, model, tp,
                 effort="high",
                 max_turns=min(est * 2, AGENT_PHASE_MAX_TURNS),
-                timeout=AGENT_PHASE_TIMEOUT)
+                timeout=AGENT_PHASE_TIMEOUT))
 
             if exec_result.get("error"):
                 phase_results.append({
@@ -1979,9 +2088,9 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
                 "2. 质量(1-5) 3. 遗漏 4. 最终摘要（一段话）"
             )
 
-            verify_result = await _agent_invoke(
+            verify_result = _safe_result(await _agent_invoke(
                 verify_prompt, project_path, None, model, "readonly",
-                effort="medium", max_turns=AGENT_VERIFY_MAX_TURNS, timeout=120)
+                effort="medium", max_turns=AGENT_VERIFY_MAX_TURNS, timeout=120))
 
             total_cost += verify_result.get("total_cost_usd", 0)
             total_turns += verify_result.get("num_turns", 0)
@@ -2073,8 +2182,9 @@ async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "started": time.time(),
     }
 
-    asyncio.create_task(
-        run_agent_loop(chat_id_str, active["path"], "opus", objective, context))
+    _create_background_task(
+        run_agent_loop(chat_id_str, active["path"], "opus", objective, context),
+        name=f"agent-{chat_id_str}")
 
 
 # ── /restart ──
@@ -2215,14 +2325,14 @@ async def _cron_scheduler(bot):
                 db.commit()
 
                 log.info(f"cron #{job_id} running: {prompt[:50]}")
-                result = await invoke_claude(
+                result = _safe_result(await invoke_claude(
                     message=prompt,
                     project_path=project_row[0],
                     session_id=None,
                     model=model,
                     tool_profile="readonly",
                     effort=effort,
-                )
+                ))
 
                 reply = result.get("result", "") or result.get("error", "No output")
                 cost = result.get("total_cost_usd", 0.0)
@@ -2277,13 +2387,14 @@ async def post_init(app: Application):
         BotCommand("task", "Readonly analyze, then execute"),
         BotCommand("budget", "Daily budget settings"),
         BotCommand("voice", "Voice reply settings"),
+        BotCommand("el", "ElevenLabs account"),
         BotCommand("restart", "Restart CB service"),
         BotCommand("agent", "Autonomous agent loop"),
         BotCommand("cron", "Scheduled tasks"),
         BotCommand("help", "Help"),
     ])
     # Start cron scheduler background task
-    asyncio.create_task(_cron_scheduler(app.bot))
+    _create_background_task(_cron_scheduler(app.bot), name="cron-scheduler")
     log.info("Claude Bridge started")
 
 
@@ -2327,6 +2438,7 @@ def main():
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("voice", cmd_voice))
+    app.add_handler(CommandHandler("el", cmd_el))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("agent", cmd_agent))
     app.add_handler(CommandHandler("cron", cmd_cron))

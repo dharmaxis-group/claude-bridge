@@ -2,6 +2,24 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.5.0] — 2026-03-13
+
+### Added
+- **`/el` command** — ElevenLabs account dashboard: view credits usage/limit, voice slots, clone capability, next billing amount
+- **Telegram behavior constraints** — system context injection enforces concise replies (<5 lines), action-first style, no emoji decoration, sensitive data masking
+- **Smart model routing** — short simple queries (<80 chars, non-complex) auto-downgrade to Sonnet + low effort for faster responses
+- **Sensitive message auto-delete** — messages containing passwords/tokens are automatically deleted from chat after processing
+- **21 ElevenLabs voices** — expanded from 5 to full Creator voice library (Sarah, Jessica, Laura, Alice, Matilda, Bella, Lily, River, George, Brian, Adam, Charlie, Roger, Callum, Harry, Liam, Will, Eric, Chris, Daniel, Bill)
+
+### Fixed
+- **Task GC leak** — `asyncio.create_task()` for fire-and-forget tasks (cron scheduler, agent loop) had no strong reference, causing "Task was destroyed but it is pending!" errors. New `_create_background_task()` holds references via a set with auto-cleanup done callback
+- **Result type safety** — `result.get()` crashed with `'list' object has no attribute 'get'` when Claude CLI returned unexpected types. New `_safe_result()` normalizes all invoke returns to dict
+- **Stream buffer overflow** — `readline()` with 4MB limit still overflowed on very large tool results ("Separator/chunk exceed limit"). Replaced with manual chunked `read(256KB)` + newline splitting, no size limit
+- **Default voice** — corrected from Adam to Sarah (user preference established in v1.4.0 session)
+
+### Security
+- ElevenLabs account upgraded to Creator plan with 2FA enabled
+
 ## [1.4.0] — 2026-03-12
 
 ### Added

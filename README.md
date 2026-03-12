@@ -18,7 +18,9 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 - **Streaming progress** — real-time display of which tools Claude is using during operations
 - **`/cron` scheduled tasks** — register recurring prompts on a schedule (add/list/rm/pause/resume)
 - **Cost tracking** — daily budget (configurable via `/budget`), per-project cost breakdown, `/cost` command
-- **Sensitive data masking** — passwords and tokens in user input are automatically masked in responses
+- **Sensitive data masking** — passwords and tokens in user input are automatically masked in responses, sensitive messages auto-deleted
+- **Smart model routing** — short simple queries auto-downgrade to Sonnet for faster responses
+- **ElevenLabs management** — `/el` command for account dashboard (credits, voice slots, billing)
 - **`/task` orchestration** — two-phase execution: readonly analysis first, then confirm to execute with full tools
 - **InlineKeyboard UI** — interactive buttons for project selection, model switching, tool permissions
 - **Tool permission profiles** — readonly (default), standard, restricted
@@ -30,7 +32,7 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 User (Telegram App)
     |
     v  Telegram Bot API (HTTPS)
-Claude Bridge (Python, ~1700 lines)
+Claude Bridge (Python, ~2400 lines)
     |
     v  subprocess stdin/stdout (JSON)
 Claude Code CLI (claude -p --output-format json)
@@ -124,6 +126,7 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | `/new` | Reset current session |
 | `/cost` | Cost summary (today / 7-day / by project) |
 | `/voice` | Voice reply settings (on/off, engine, voice selection with preview) |
+| `/el` | ElevenLabs account dashboard (credits, usage, voice slots, billing) |
 | `/cron` | Scheduled tasks (add/list/rm/pause/resume) |
 | `/restart` | Restart CB service (LaunchAgent auto-respawn) |
 
