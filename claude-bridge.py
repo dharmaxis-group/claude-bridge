@@ -693,12 +693,98 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-TTS_VOICE = "zh-CN-XiaoxiaoNeural"
 TTS_MAX_CHARS = 800  # TTS 文本上限，超长只语音前 800 字
+
+# ── TTS 引擎配置 ──
+EDGE_TTS_VOICES = {
+    "Xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "Xiaoyi": "zh-CN-XiaoyiNeural",
+    "Yunxi": "zh-CN-YunxiNeural",
+    "Yunjian": "zh-CN-YunjianNeural",
+    "Yunyang": "zh-CN-YunyangNeural",
+    "Yunxia": "zh-CN-YunxiaNeural",
+    "Xiaobei": "zh-CN-liaoning-XiaobeiNeural",
+    "Xiaoni": "zh-CN-shaanxi-XiaoniNeural",
+}
+ELEVENLABS_VOICES = {
+    "Sarah": "EXAVITQu4vr4xnSDxMaL",
+    "George": "JBFqnCBsd6RMkjVDRZzb",
+    "Brian": "nPczCjzI2devNBz1zQrb",
+    "Jessica": "cgSgspJ2msm6clMCkdW9",
+    "Adam": "pNInz6obpgDQGcFmaJgB",
+}
+ELEVENLABS_MODEL = "eleven_v3"
+
+
+def _get_voice_settings() -> dict:
+    """Get voice TTS settings from DB. Returns {enabled, engine, voice}."""
+    return {
+        "enabled": get_setting("voice_enabled", "1") == "1",
+        "engine": get_setting("voice_engine", "edge"),  # "edge" or "eleven"
+        "voice": get_setting("voice_name", "Xiaoxiao"),
+    }
+
+
+def _get_elevenlabs_key() -> str:
+    """Read ElevenLabs API key from Keychain."""
+    import subprocess as _sp
+    return _sp.check_output(
+        ["security", "find-generic-password", "-s", "elevenlabs-api-key", "-a", "elevenlabs", "-w"],
+        text=True,
+    ).strip()
+
+
+async def _tts_edge(clean: str, mp3_path, ogg_path, voice_name: str):
+    """Generate voice via edge-tts."""
+    voice_id = EDGE_TTS_VOICES.get(voice_name, "zh-CN-XiaoxiaoNeural")
+    proc = await asyncio.create_subprocess_exec(
+        "edge-tts", "--voice", voice_id, "--text", clean,
+        "--write-media", str(mp3_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=60)
+    if proc.returncode != 0 or not mp3_path.exists():
+        return False
+    # ffmpeg MP3 → OGG Opus
+    proc2 = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", str(mp3_path),
+        "-c:a", "libopus", "-b:a", "48k", str(ogg_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc2.communicate(), timeout=30)
+    return proc2.returncode == 0 and ogg_path.exists()
+
+
+async def _tts_elevenlabs(clean: str, mp3_path, ogg_path, voice_name: str):
+    """Generate voice via ElevenLabs API."""
+    import httpx
+    voice_id = ELEVENLABS_VOICES.get(voice_name, "EXAVITQu4vr4xnSDxMaL")
+    api_key = _get_elevenlabs_key()
+    async with httpx.AsyncClient(proxy="http://127.0.0.1:1082", timeout=30) as client:
+        resp = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={"text": clean, "model_id": ELEVENLABS_MODEL},
+        )
+    if resp.status_code != 200:
+        log.error(f"ElevenLabs API error: {resp.status_code} {resp.text[:200]}")
+        return False
+    mp3_path.write_bytes(resp.content)
+    # ffmpeg MP3 → OGG Opus
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", str(mp3_path),
+        "-c:a", "libopus", "-b:a", "48k", str(ogg_path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await asyncio.wait_for(proc.communicate(), timeout=30)
+    return proc.returncode == 0 and ogg_path.exists()
 
 
 async def _send_voice_reply(bot, chat_id: int, text: str):
-    """Convert text to voice via edge-tts → ffmpeg → send_voice."""
+    """Convert text to voice via configured TTS engine → send_voice."""
+    vs = _get_voice_settings()
+    if not vs["enabled"]:
+        return
     VOICE_DIR.mkdir(parents=True, exist_ok=True)
     # Strip markdown/code formatting for cleaner speech
     clean = re.sub(r'```[\s\S]*?```', '', text)  # remove code blocks
@@ -713,29 +799,14 @@ async def _send_voice_reply(bot, chat_id: int, text: str):
     ogg_path = mp3_path.with_suffix(".ogg")
 
     try:
-        # edge-tts → MP3
-        proc = await asyncio.create_subprocess_exec(
-            "edge-tts", "--voice", TTS_VOICE, "--text", clean,
-            "--write-media", str(mp3_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0 or not mp3_path.exists():
+        if vs["engine"] == "eleven":
+            ok = await _tts_elevenlabs(clean, mp3_path, ogg_path, vs["voice"])
+        else:
+            ok = await _tts_edge(clean, mp3_path, ogg_path, vs["voice"])
+        if not ok:
             return
-
-        # ffmpeg MP3 → OGG Opus
-        proc2 = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", str(mp3_path),
-            "-c:a", "libopus", "-b:a", "48k", str(ogg_path),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc2.communicate(), timeout=30)
-        if proc2.returncode != 0 or not ogg_path.exists():
-            return
-
         with open(ogg_path, "rb") as f:
             await bot.send_voice(chat_id=chat_id, voice=f)
-
     except Exception as e:
         log.error(f"TTS failed: {e}")
     finally:
@@ -1065,6 +1136,34 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+def _voice_panel_text(vs: dict) -> str:
+    """Build voice settings display text."""
+    status = "ON" if vs["enabled"] else "OFF"
+    engine = "edge-tts" if vs["engine"] == "edge" else "ElevenLabs"
+    return f"Voice Reply: {status}\nEngine: {engine}\nVoice: {vs['voice']}"
+
+
+def _voice_panel_kb(vs: dict):
+    """Build voice settings InlineKeyboard."""
+    items = []
+    if vs["enabled"]:
+        items.append(("Turn Off", "voice:off"))
+    else:
+        items.append(("Turn On", "voice:on"))
+    engine_label = "Switch → ElevenLabs" if vs["engine"] == "edge" else "Switch → edge-tts"
+    items.append((engine_label, "voice:toggle_engine"))
+    items.append(("Change Voice", "voice:pick"))
+    return make_keyboard(items, columns=2)
+
+
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/voice — 语音回复设置"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    vs = _get_voice_settings()
+    await update.message.reply_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
+
+
 async def cmd_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/budget — 每日预算管理"""
     if not is_allowed(update.effective_chat.id):
@@ -1216,6 +1315,85 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 items.append((f"{marker}{name}", f"tools:{key}"))
             kb = make_keyboard(items, columns=3, back_to="menu:status")
             await query.edit_message_text("Select tool access:", reply_markup=kb)
+
+    # ── voice:<action> ──
+    elif data.startswith("voice:"):
+        action = data.split(":", 1)[1]
+        vs = _get_voice_settings()
+
+        if action == "off":
+            set_setting("voice_enabled", "0")
+            vs["enabled"] = False
+            await query.edit_message_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
+
+        elif action == "on":
+            set_setting("voice_enabled", "1")
+            vs["enabled"] = True
+            await query.edit_message_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
+
+        elif action == "toggle_engine":
+            new_engine = "eleven" if vs["engine"] == "edge" else "edge"
+            set_setting("voice_engine", new_engine)
+            # Reset voice to first available for new engine
+            if new_engine == "edge":
+                default_voice = list(EDGE_TTS_VOICES.keys())[0]
+            else:
+                default_voice = list(ELEVENLABS_VOICES.keys())[0]
+            set_setting("voice_name", default_voice)
+            vs["engine"] = new_engine
+            vs["voice"] = default_voice
+            await query.edit_message_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
+
+        elif action == "pick":
+            voices = EDGE_TTS_VOICES if vs["engine"] == "edge" else ELEVENLABS_VOICES
+            rows = []
+            for name in voices:
+                marker = ">> " if name == vs["voice"] else ""
+                rows.append([
+                    InlineKeyboardButton(f"{marker}{name}", callback_data=f"voice:set:{name}"),
+                    InlineKeyboardButton("Preview", callback_data=f"voice:preview:{name}"),
+                ])
+            rows.append([InlineKeyboardButton("<< Back", callback_data="voice:back")])
+            kb = InlineKeyboardMarkup(rows)
+            engine_label = "edge-tts" if vs["engine"] == "edge" else "ElevenLabs"
+            await query.edit_message_text(f"Select voice ({engine_label}):", reply_markup=kb)
+
+        elif action.startswith("preview:"):
+            voice_name = action.split(":", 1)[1]
+            preview_text = "你好，我是你的智能助手，有什么可以帮你的吗？"
+            mp3_path = VOICE_DIR / f"preview_{int(time.time())}.mp3"
+            ogg_path = mp3_path.with_suffix(".ogg")
+            try:
+                if vs["engine"] == "eleven":
+                    ok = await _tts_elevenlabs(preview_text, mp3_path, ogg_path, voice_name)
+                else:
+                    ok = await _tts_edge(preview_text, mp3_path, ogg_path, voice_name)
+                if ok:
+                    engine_label = "edge-tts" if vs["engine"] == "edge" else "ElevenLabs"
+                    with open(ogg_path, "rb") as f:
+                        await query.message.chat.send_voice(
+                            voice=f, caption=f"Preview: {voice_name} ({engine_label})"
+                        )
+                else:
+                    await query.message.chat.send_message("Preview failed.")
+            except Exception as e:
+                log.error(f"Voice preview failed: {e}")
+                await query.message.chat.send_message(f"Preview error: {e}")
+            finally:
+                try:
+                    mp3_path.unlink(missing_ok=True)
+                    ogg_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        elif action.startswith("set:"):
+            voice_name = action.split(":", 1)[1]
+            set_setting("voice_name", voice_name)
+            vs["voice"] = voice_name
+            await query.edit_message_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
+
+        elif action == "back":
+            await query.edit_message_text(_voice_panel_text(vs), reply_markup=_voice_panel_kb(vs))
 
     # ── cmd:<action> ──
     elif data.startswith("cmd:"):
@@ -1910,6 +2088,7 @@ async def post_init(app: Application):
         BotCommand("cost", "Cost summary"),
         BotCommand("task", "Readonly analyze, then execute"),
         BotCommand("budget", "Daily budget settings"),
+        BotCommand("voice", "Voice reply settings"),
         BotCommand("restart", "Restart CB service"),
         BotCommand("agent", "Autonomous agent loop"),
         BotCommand("cron", "Scheduled tasks"),
@@ -1959,6 +2138,7 @@ def main():
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("budget", cmd_budget))
+    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("agent", cmd_agent))
     app.add_handler(CommandHandler("cron", cmd_cron))
