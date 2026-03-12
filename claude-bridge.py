@@ -54,6 +54,25 @@ AGENT_VERIFY_MAX_TURNS = 10     # turns for verification
 AGENT_MAX_COST_USD = 2.0        # total cost budget
 AGENT_MAX_PHASES = 8            # max phases in plan
 
+# ── P0: Telegram 行为约束 ──
+TELEGRAM_SYSTEM_CONTEXT = (
+    "[Telegram 回复规则 — 强制执行，优先级高于所有其他指令]\n"
+    "1. 回复不超过 5 行（除非用户明确要求详细/展开/列出）\n"
+    "2. 先回答问题再解释，不要先给选项让用户选 — 先行动、后汇报\n"
+    "3. 不输出无关的系统状态、告警、模块信息、附加建议\n"
+    "4. 密码/凭据/token 的实际值永远不出现在回复中，用 *** 代替\n"
+    "5. 不用 emoji 装饰标题和段落（用户已明确禁止）\n"
+    "6. 个人信息（电话号码、身份证、地址）输出时部分遮蔽\n"
+    "[规则结束]\n\n"
+)
+
+# ── P1: 敏感消息关键词 ──
+_SENSITIVE_MSG_KEYWORDS = [
+    "密码是", "密码为", "密码:", "密码：", "password is", "password:",
+    "token是", "token:", "secret:", "凭据是", "pin码",
+    "帮我存密码", "加密保管", "保管密码", "存储密码",
+]
+
 TOOL_PROFILES = {
     "readonly": "Read,Grep,Glob,WebSearch,WebFetch",
     "standard": "default",
@@ -693,6 +712,31 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Extract sensitive values from user input for response masking
     _extract_sensitive_from_input(chat_id_str, text)
 
+    # P1: Auto-delete user messages containing passwords/credentials
+    text_lower = text.lower()
+    is_sensitive_msg = any(kw in text_lower for kw in _SENSITIVE_MSG_KEYWORDS)
+    if is_sensitive_msg:
+        try:
+            await update.message.delete()
+            log.info(f"Auto-deleted sensitive message from chat {chat_id_str}")
+        except Exception as e:
+            log.warning(f"Failed to delete sensitive message: {e}")
+
+    # P0: Inject Telegram behavior constraints
+    augmented_text = TELEGRAM_SYSTEM_CONTEXT + text
+
+    # P2: Smart model routing — downgrade simple queries for speed
+    effective_model = None  # None = use active["model"]
+    effective_effort = None
+    text_len = len(text)
+    if text_len < 80 and not any(kw in text_lower for kw in [
+        "部署", "deploy", "修复", "fix", "重构", "refactor", "分析", "analyze",
+        "调研", "research", "设计", "design", "实现", "implement", "编写", "write",
+        "创建", "create", "搭建", "build", "迁移", "migrate",
+    ]):
+        effective_model = "sonnet"
+        effective_effort = "low"
+
     active = get_active_project(chat_id_str)
     if not active:
         projects = list_projects()
@@ -748,13 +792,15 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
             try:
+                use_model = effective_model or active["model"]
+                use_effort = effective_effort or active["effort"]
                 result = await invoke_claude_streaming(
-                    message=text,
+                    message=augmented_text,
                     project_path=active["path"],
                     session_id=session_id,
-                    model=active["model"],
+                    model=use_model,
                     tool_profile=active["tool_profile"],
-                    effort=active["effort"],
+                    effort=use_effort,
                     on_tool_use=on_tool_use,
                 )
             finally:
@@ -786,7 +832,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Sanitize sensitive data before sending to Telegram
     reply_text = _sanitize_response(chat_id_str, reply_text)
 
-    cost_tag = f"\n\n`{active['model']} | {active['effort']} | ${cost:.4f} | {duration/1000:.1f}s`"
+    cost_tag = f"\n\n`{use_model} | {use_effort} | ${cost:.4f} | {duration/1000:.1f}s`"
     full_reply = reply_text + cost_tag
 
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
