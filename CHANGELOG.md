@@ -2,6 +2,12 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [Unreleased]
+
+### Added
+- **Blog Features page** — comprehensive feature listing at `/p/features.html`, organized by category (Core Communication, Voice, Project Management, Automation, Cost, Security, Operations) with full command reference table
+- **Navigation update** — added Features link to blog header nav (desktop + mobile): Home / Features / Why CB? / Changelog
+
 ## [1.5.0] — 2026-03-13
 
 ### Added
