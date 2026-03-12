@@ -2,6 +2,19 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.4.0] — 2026-03-12
+
+### Added
+- **Voice reply** — bot replies with both text and voice message when user sends voice. Supports two TTS engines: edge-tts (free, local) and ElevenLabs (cloud, higher quality)
+- **`/voice` command** — interactive voice settings panel: toggle voice reply on/off, switch TTS engine (edge-tts / ElevenLabs), select voice with live preview
+- **ElevenLabs integration** — cloud TTS with Sarah v3 voice for natural Chinese speech. API key stored in macOS Keychain
+- **8 edge-tts Chinese voices** — Xiaoxiao, Xiaoyi, Yunxi, Yunjian, Yunyang, Yunxia, Xiaobei (Liaoning dialect), Xiaoni (Shaanxi dialect)
+- **5 ElevenLabs voices** — Sarah, George, Brian, Jessica, Adam (all with eleven_v3 model)
+- **Sensitive data masking** — passwords and tokens in user input are automatically masked in bot responses
+
+### Changed
+- Streaming subprocess buffer increased to 4MB (was 64KB default, caused truncation on large tool results)
+
 ## [1.3.0] — 2026-03-12
 
 ### Added

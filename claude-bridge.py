@@ -596,6 +596,94 @@ async def send_long_message(bot, chat_id: int, text: str):
             await bot.send_message(chat_id=chat_id, text=chunk)
 
 
+STREAM_INTERVAL = 0.35       # seconds between edits
+STREAM_INITIAL_CHUNK = 20    # chars for first reveal
+STREAM_ACCEL = 1.4           # chunk growth factor per step
+STREAM_MAX_CHUNK = 200       # max chars per edit step
+STREAM_MSG_LIMIT = 3800      # start new message before hitting Telegram 4096 limit
+
+
+async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
+    """Progressively reveal text in a Telegram message (typing effect).
+    If reuse_msg is provided, edits that message; otherwise creates a new one."""
+    if not text or not text.strip():
+        if reuse_msg:
+            try:
+                await reuse_msg.delete()
+            except Exception:
+                pass
+        return
+
+    cursor = "▍"
+    pos = 0
+    chunk_size = float(STREAM_INITIAL_CHUNK)
+    msg = reuse_msg
+
+    # First edit: clear progress content, show cursor
+    if msg:
+        try:
+            await msg.edit_text(cursor)
+        except Exception:
+            msg = None
+
+    if not msg:
+        msg = await bot.send_message(chat_id=chat_id, text=cursor)
+
+    while pos < len(text):
+        step = int(chunk_size)
+        # Snap to word/line boundary for natural reveals
+        target = min(pos + step, len(text))
+        if target < len(text):
+            # Try to break at newline first, then space
+            nl = text.rfind("\n", pos, target + 1)
+            sp = text.rfind(" ", pos, target + 1)
+            if nl > pos:
+                target = nl + 1
+            elif sp > pos:
+                target = sp + 1
+        pos = target
+
+        # Check if we need to start a new message (approaching Telegram limit)
+        if pos > STREAM_MSG_LIMIT and pos < len(text):
+            # Finalize current message with text so far (no cursor)
+            try:
+                await msg.edit_text(text[:pos], parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                try:
+                    await msg.edit_text(text[:pos])
+                except Exception:
+                    pass
+            # Start new message for remaining text
+            text = text[pos:]
+            pos = 0
+            chunk_size = float(STREAM_INITIAL_CHUNK)
+            msg = await bot.send_message(chat_id=chat_id, text=cursor)
+            continue
+
+        display = text[:pos] + (cursor if pos < len(text) else "")
+        try:
+            await msg.edit_text(display, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            try:
+                await msg.edit_text(display)
+            except Exception:
+                pass
+
+        chunk_size = min(chunk_size * STREAM_ACCEL, STREAM_MAX_CHUNK)
+        if pos < len(text):
+            await asyncio.sleep(STREAM_INTERVAL)
+
+    # Final edit without cursor (if cursor was shown)
+    if cursor in (text[:pos] + cursor):
+        try:
+            await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            try:
+                await msg.edit_text(text)
+            except Exception:
+                pass
+
+
 async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             text: str):
     """共享的 Claude 调用 + 回复逻辑，供 handle_message 和 handle_photo 使用"""
@@ -673,13 +761,11 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 stop_typing.set()
                 await typing_task
 
-    # Clean up progress message
-    try:
-        await progress_msg.delete()
-    except Exception:
-        pass
-
     if result.get("error") and not result.get("result"):
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
         await update.message.reply_text(f"Error: {result['error'][:500]}")
         return None
 
@@ -701,11 +787,13 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     reply_text = _sanitize_response(chat_id_str, reply_text)
 
     cost_tag = f"\n\n`{active['model']} | {active['effort']} | ${cost:.4f} | {duration/1000:.1f}s`"
-    reply_text += cost_tag
+    full_reply = reply_text + cost_tag
 
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
     log_cost(chat_id_str, active["project"], cost, turns, duration)
-    await send_long_message(context.bot, chat_id, reply_text)
+
+    # Streaming typing effect: progressively reveal text in the progress message
+    await _stream_reply(context.bot, chat_id, full_reply, progress_msg)
     return result.get("result", "")
 
 

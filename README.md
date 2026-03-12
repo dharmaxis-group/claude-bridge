@@ -12,7 +12,13 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 - **Multi-project management** — switch between projects via `/p`. Each project has its own CLAUDE.md, session state, and cost tracking
 - **Session persistence** — SQLite-backed sessions with `--resume` support
 - **Image support** — send photos from Telegram, Claude reads them via the Read tool
+- **Voice messages** — send voice messages, auto-transcribed via Whisper. Bot replies with text + voice
+- **Voice settings** — `/voice` to toggle voice reply, switch TTS engine (edge-tts / ElevenLabs), select voice with preview
+- **Document handling** — send PDF, code files, logs directly. Claude reads and analyzes the content
+- **Streaming progress** — real-time display of which tools Claude is using during operations
+- **`/cron` scheduled tasks** — register recurring prompts on a schedule (add/list/rm/pause/resume)
 - **Cost tracking** — daily budget (configurable via `/budget`), per-project cost breakdown, `/cost` command
+- **Sensitive data masking** — passwords and tokens in user input are automatically masked in responses
 - **`/task` orchestration** — two-phase execution: readonly analysis first, then confirm to execute with full tools
 - **InlineKeyboard UI** — interactive buttons for project selection, model switching, tool permissions
 - **Tool permission profiles** — readonly (default), standard, restricted
@@ -24,7 +30,7 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 User (Telegram App)
     |
     v  Telegram Bot API (HTTPS)
-Claude Bridge (Python, ~900 lines)
+Claude Bridge (Python, ~1700 lines)
     |
     v  subprocess stdin/stdout (JSON)
 Claude Code CLI (claude -p --output-format json)
@@ -117,6 +123,8 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | `/budget` | Daily budget settings (on/off/set amount) |
 | `/new` | Reset current session |
 | `/cost` | Cost summary (today / 7-day / by project) |
+| `/voice` | Voice reply settings (on/off, engine, voice selection with preview) |
+| `/cron` | Scheduled tasks (add/list/rm/pause/resume) |
 | `/restart` | Restart CB service (LaunchAgent auto-respawn) |
 
 ### Message Types
@@ -126,6 +134,8 @@ security add-generic-password -s "claude-bridge-bot-token" -a "claude-bridge" -w
 | Text | Sent as prompt to `claude -p` via stdin |
 | Image | Downloaded, then Claude reads it via the Read tool |
 | Image + Caption | Image path + caption combined as prompt |
+| Voice | Whisper transcription → Claude prompt → text + voice reply |
+| Document | Downloaded file → Claude reads and analyzes |
 
 ### Tool Permissions
 
