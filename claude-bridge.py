@@ -191,6 +191,51 @@ db: sqlite3.Connection = None
 user_locks: dict[str, asyncio.Lock] = {}
 worker_semaphore: asyncio.Semaphore = None
 agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
+_sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
+
+# ── 敏感信息防护 ──
+
+_SENSITIVE_KW_RE = re.compile(
+    r'(?:密码|password|passwd|secret|token|credential|凭据|口令|pin码?)'
+    r'[\s:：=是为]*'
+    r'[`"\']?'
+    r'([^\s`"\'，。,.\n]{4,64})'
+    r'[`"\']?',
+    re.IGNORECASE,
+)
+
+
+def _extract_sensitive_from_input(chat_id: str, text: str):
+    """Extract and store potential passwords/credentials from user input."""
+    matches = _SENSITIVE_KW_RE.findall(text)
+    if matches:
+        vals = _sensitive_values.setdefault(chat_id, [])
+        for m in matches:
+            if m not in vals:
+                vals.append(m)
+        _sensitive_values[chat_id] = vals[-20:]  # keep last 20
+
+
+def _mask_value(val: str) -> str:
+    if len(val) <= 3:
+        return "***"
+    return val[0] + "*" * (len(val) - 2) + val[-1]
+
+
+def _sanitize_response(chat_id: str, text: str) -> str:
+    """Mask sensitive values in outgoing response text. Two layers:
+    1. Exact-match: mask values previously extracted from user input.
+    2. Keyword-proximity: mask values adjacent to password keywords in the response."""
+    # Layer 1: exact match from tracked user input
+    for val in _sensitive_values.get(chat_id, []):
+        if val in text:
+            text = text.replace(val, _mask_value(val))
+    # Layer 2: keyword-proximity in response text
+    def _kw_mask(m):
+        val = m.group(1)
+        return m.group(0).replace(val, _mask_value(val))
+    text = _SENSITIVE_KW_RE.sub(_kw_mask, text)
+    return text
 
 
 def get_user_lock(chat_id: str) -> asyncio.Lock:
@@ -453,6 +498,7 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
             stderr=asyncio.subprocess.PIPE,
             cwd=project_path,
             env=CLAUDE_ENV,
+            limit=4 * 1024 * 1024,  # 4MB line buffer (default 64KB too small for large tool results)
         )
         proc.stdin.write(message.encode("utf-8"))
         await proc.stdin.drain()
@@ -528,6 +574,8 @@ async def send_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, sto
 
 async def send_long_message(bot, chat_id: int, text: str):
     """Split and send a long message. Accepts Bot instance directly."""
+    # Sanitize sensitive data at the final output gate
+    text = _sanitize_response(str(chat_id), text)
     chunks = []
     while len(text) > TELEGRAM_MAX_LEN:
         split_pos = text.rfind("\n", 0, TELEGRAM_MAX_LEN)
@@ -553,6 +601,9 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     """共享的 Claude 调用 + 回复逻辑，供 handle_message 和 handle_photo 使用"""
     chat_id = update.effective_chat.id
     chat_id_str = str(chat_id)
+
+    # Extract sensitive values from user input for response masking
+    _extract_sensitive_from_input(chat_id_str, text)
 
     active = get_active_project(chat_id_str)
     if not active:
@@ -645,6 +696,9 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     cost = result.get("total_cost_usd", 0.0)
     turns = result.get("num_turns", 1)
     duration = result.get("duration_ms", 0)
+
+    # Sanitize sensitive data before sending to Telegram
+    reply_text = _sanitize_response(chat_id_str, reply_text)
 
     cost_tag = f"\n\n`{active['model']} | {active['effort']} | ${cost:.4f} | {duration/1000:.1f}s`"
     reply_text += cost_tag
