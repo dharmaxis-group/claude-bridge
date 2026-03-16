@@ -8,6 +8,10 @@ All notable changes to Claude Bridge are documented here.
 - **Blog Features page** — comprehensive feature listing at `/p/features.html`, organized by category (Core Communication, Voice, Project Management, Automation, Cost, Security, Operations) with full command reference table
 - **Navigation update** — added Features link to blog header nav (desktop + mobile): Home / Features / Why CB? / Changelog
 
+### Fixed
+- **Model callback validation** — model selection via InlineKeyboard accepted arbitrary values without checking against MODELS whitelist. Now validates `model in MODELS` before writing to DB, consistent with effort/tools handlers
+- **ElevenLabs key exception** — `/el` command crashed with unhandled `CalledProcessError` when Keychain entry was missing. Now catches exception and returns user-friendly error message
+
 ## [1.5.0] — 2026-03-13
 
 ### Added

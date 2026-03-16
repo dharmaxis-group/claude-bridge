@@ -108,6 +108,9 @@ def load_config() -> dict:
     import subprocess as _sp
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
+    # Power-user feature: config values prefixed with "!" are executed as shell
+    # commands and replaced with their stdout. This runs with the privileges of the
+    # bot process, so config.json must be owner-writable only (0600/0644).
     for k, v in cfg.items():
         if isinstance(v, str) and v.startswith("!"):
             cmd = v[1:]
@@ -1410,7 +1413,10 @@ async def cmd_el(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_chat.id):
         return
     import httpx
-    api_key = _get_elevenlabs_key()
+    try:
+        api_key = _get_elevenlabs_key()
+    except Exception:
+        api_key = None
     if not api_key:
         await update.message.reply_text("ElevenLabs API key not found in Keychain.")
         return
@@ -1542,7 +1548,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── model:<name> ──
     elif data.startswith("model:"):
         model = data.split(":", 1)[1]
-        if active:
+        if model in MODELS and active:
             set_active_project(chat_id_str, active["project"], model=model)
         text, kb = _status_panel()
         await query.edit_message_text(text, reply_markup=kb)
