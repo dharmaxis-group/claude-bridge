@@ -43,6 +43,7 @@ SESSION_ROTATE_COST = 2.0
 DAILY_BUDGET_USD = 100.0
 CLAUDE_TIMEOUT = 900
 PROGRESS_EDIT_INTERVAL = 3.0  # min seconds between Telegram progress message edits
+TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
 
@@ -366,7 +367,7 @@ def get_budget() -> tuple[bool, float]:
 def get_daily_cost(chat_id: str) -> float:
     row = db.execute(
         "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_log "
-        "WHERE chat_id=? AND date(created_at)=date('now')", (chat_id,),
+        f"WHERE chat_id=? AND date(created_at, '{TZ_OFFSET}')=date('now', '{TZ_OFFSET}')", (chat_id,),
     ).fetchone()
     return row[0] if row else 0.0
 
@@ -1361,11 +1362,11 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_str = str(update.effective_chat.id)
     today = db.execute(
         "SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(turns),0) FROM cost_log "
-        "WHERE chat_id=? AND date(created_at)=date('now')", (chat_id_str,)
+        f"WHERE chat_id=? AND date(created_at, '{TZ_OFFSET}')=date('now', '{TZ_OFFSET}')", (chat_id_str,)
     ).fetchone()
     week = db.execute(
         "SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(turns),0) FROM cost_log "
-        "WHERE chat_id=? AND created_at >= datetime('now', '-7 days')", (chat_id_str,)
+        f"WHERE chat_id=? AND datetime(created_at, '{TZ_OFFSET}') >= datetime('now', '{TZ_OFFSET}', '-7 days')", (chat_id_str,)
     ).fetchone()
     total = db.execute(
         "SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(turns),0) FROM cost_log "
@@ -1706,7 +1707,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "cost":
             today = db.execute(
                 "SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(turns),0) FROM cost_log "
-                "WHERE chat_id=? AND date(created_at)=date('now')", (chat_id_str,)
+                f"WHERE chat_id=? AND date(created_at, '{TZ_OFFSET}')=date('now', '{TZ_OFFSET}')", (chat_id_str,)
             ).fetchone()
             kb = make_keyboard([], back_to="menu:status")
             await query.edit_message_text(
