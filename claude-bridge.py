@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -46,6 +47,8 @@ PROGRESS_EDIT_INTERVAL = 3.0  # min seconds between Telegram progress message ed
 TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
+WAVE_FRAMES = ["◉ ◌ ◌", "◌ ◉ ◌", "◌ ◌ ◉", "◌ ◉ ◌"]
+WAVE_INTERVAL = 0.6  # seconds between wave animation frames
 
 # ── Agent Loop 常量 ──
 AGENT_PHASE_TIMEOUT = 600       # 10 min per phase
@@ -216,6 +219,8 @@ worker_semaphore: asyncio.Semaphore = None
 agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
 _sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
+_watchdog_ts: float = time.time()  # updated by heartbeat; checked by OS thread watchdog
+WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
 
 # ── 敏感信息防护 ──
 
@@ -814,29 +819,41 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb,
         )
 
-    # Progress message for streaming feedback
-    progress_msg = await update.message.reply_text("Working...")
+    # Progress message with wave animation
+    progress_msg = await update.message.reply_text(WAVE_FRAMES[0])
     progress_lines = []
-    last_edit = 0.0
+    stop_wave = asyncio.Event()
 
-    async def on_tool_use(tool_name: str, tool_input: dict):
-        nonlocal last_edit
-        progress_lines.append(_format_tool_progress(tool_name, tool_input))
-        now = time.monotonic()
-        if now - last_edit >= PROGRESS_EDIT_INTERVAL:
-            last_edit = now
-            display = progress_lines[-6:]
-            progress_text = "Working...\n" + "\n".join(f"`> {l}`" for l in display)
+    async def _wave_animation():
+        """Animate wave dots + tool progress on the progress message."""
+        frame_idx = 0
+        while not stop_wave.is_set():
+            frame_idx += 1
+            wave = WAVE_FRAMES[frame_idx % len(WAVE_FRAMES)]
+            if progress_lines:
+                display = progress_lines[-6:]
+                text = wave + "\n" + "\n".join(f"`> {l}`" for l in display)
+            else:
+                text = wave
             try:
-                await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN)
+                await progress_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
+            try:
+                await asyncio.wait_for(stop_wave.wait(), timeout=WAVE_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    async def on_tool_use(tool_name: str, tool_input: dict):
+        progress_lines.append(_format_tool_progress(tool_name, tool_input))
 
     lock = get_user_lock(chat_id_str)
     async with lock:
         async with worker_semaphore:
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
+            wave_task = asyncio.create_task(_wave_animation())
             try:
                 use_model = effective_model or active["model"]
                 use_effort = effective_effort or active["effort"]
@@ -851,7 +868,9 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 )
             finally:
                 stop_typing.set()
+                stop_wave.set()
                 await typing_task
+                await wave_task
 
     result = _safe_result(result)
     if result.get("error") and not result.get("result"):
@@ -2303,6 +2322,34 @@ async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _heartbeat_loop():
+    """Background task: push heartbeat to Uptime Kuma every 120s."""
+    global _watchdog_ts
+    import urllib.request
+    _HB_URL = "http://<REDACTED_HOST>:3001/api/push/<REDACTED_TOKEN>?status=up&msg=OK&ping="
+    await asyncio.sleep(5)
+    while True:
+        _watchdog_ts = time.time()  # tick for OS thread watchdog
+        try:
+            urllib.request.urlopen(_HB_URL, timeout=5)
+        except Exception:
+            pass
+        await asyncio.sleep(120)
+
+
+def _start_watchdog_thread():
+    """OS thread watchdog: kills process if asyncio event loop freezes."""
+    def _watchdog():
+        while True:
+            time.sleep(60)
+            stale = time.time() - _watchdog_ts
+            if stale > WATCHDOG_STALE_SEC:
+                log.error(f"Watchdog: event loop frozen for {stale:.0f}s, forcing restart")
+                os._exit(1)
+    t = threading.Thread(target=_watchdog, daemon=True, name="watchdog")
+    t.start()
+
+
 async def _cron_scheduler(bot):
     """Background task: check and run due cron jobs every 60s."""
     await asyncio.sleep(10)  # initial delay after startup
@@ -2402,6 +2449,8 @@ async def post_init(app: Application):
     ])
     # Start cron scheduler background task
     _create_background_task(_cron_scheduler(app.bot), name="cron-scheduler")
+    # Start Uptime Kuma heartbeat
+    _create_background_task(_heartbeat_loop(), name="uptime-kuma-heartbeat")
     log.info("Claude Bridge started")
 
 
@@ -2457,6 +2506,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    _start_watchdog_thread()
     log.info(f"Starting with proxy={proxy}, allowed={cfg.get('allowFrom', [])}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,
                      bootstrap_retries=-1)
