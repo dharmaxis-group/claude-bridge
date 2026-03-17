@@ -48,7 +48,7 @@ TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
 DEFAULT_EFFORT = "medium"
 VALID_EFFORTS = {"low", "medium", "high"}
 WAVE_FRAMES = ["◉ ◌ ◌", "◌ ◉ ◌", "◌ ◌ ◉", "◌ ◉ ◌"]
-WAVE_INTERVAL = 0.6  # seconds between wave animation frames
+WAVE_INTERVAL = 0.4  # seconds between wave animation frames (Telegram edit rate limit ~0.3s)
 
 # ── Agent Loop 常量 ──
 AGENT_PHASE_TIMEOUT = 600       # 10 min per phase
