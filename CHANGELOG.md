@@ -2,13 +2,23 @@
 
 All notable changes to Claude Bridge are documented here.
 
-## [Unreleased]
+## [1.6.0] — 2026-03-18
 
 ### Added
 - **Blog Features page** — comprehensive feature listing at `/p/features.html`, organized by category (Core Communication, Voice, Project Management, Automation, Cost, Security, Operations) with full command reference table
 - **Navigation update** — added Features link to blog header nav (desktop + mobile): Home / Features / Why CB? / Changelog
 - **Wave animation progress** — replaced static "Working..." with animated `◉ ◌ ◌` wave dots (0.6s/frame) during Claude invocation. Tool progress lines appear below the wave
 - **Event loop watchdog** — independent OS thread monitors asyncio heartbeat; forces process restart via `os._exit(1)` if event loop freezes for >5 minutes (LaunchAgent auto-restarts)
+- **Uptime Kuma heartbeat** — push-type health monitor pings Uptime Kuma every 2 minutes; LaunchAgent restarts automatically on miss
+- **Poll monitor watchdog** — second OS-thread watchdog checks `updater.running` every 30s; forces restart if Telegram polling silently dies
+
+### Changed
+- **Default model → Opus 4.6** — upgraded from Sonnet for all requests
+- **Default effort → high** — raised from medium
+- **No timeout** — removed 900s `CLAUDE_TIMEOUT` to support long-running remote maintenance tasks from phone
+- **Removed smart model routing** — eliminated auto-downgrade to Sonnet/low-effort for short queries; all requests use active model/effort settings
+- **MAX_TURNS 8→50** — prevents complex tasks (sync/review/deploy) from being truncated with empty response when last turn is a tool call
+- **6 projects registered** — added <redacted> and <redacted> to CB project registry
 
 ### Fixed
 - **Model callback validation** — model selection via InlineKeyboard accepted arbitrary values without checking against MODELS whitelist. Now validates `model in MODELS` before writing to DB, consistent with effort/tools handlers

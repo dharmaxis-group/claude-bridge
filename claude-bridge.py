@@ -35,17 +35,17 @@ LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
 IMAGE_DIR = CB_HOME / "data" / "images"
 VOICE_DIR = CB_HOME / "data" / "voice"
 
-DEFAULT_MODEL = "sonnet"
-MAX_TURNS = 8
+DEFAULT_MODEL = "opus"
+MAX_TURNS = 50  # enough for complex tasks like sync/review
 MAX_CONCURRENT_WORKERS = 2
 TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
 DAILY_BUDGET_USD = 100.0
-CLAUDE_TIMEOUT = 900
+CLAUDE_TIMEOUT = None  # no timeout — remote maintenance via phone needs long-running tasks
 PROGRESS_EDIT_INTERVAL = 3.0  # min seconds between Telegram progress message edits
 TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
-DEFAULT_EFFORT = "medium"
+DEFAULT_EFFORT = "high"
 VALID_EFFORTS = {"low", "medium", "high"}
 WAVE_FRAMES = ["◉ ◌ ◌", "◌ ◉ ◌", "◌ ◌ ◉", "◌ ◉ ◌"]
 WAVE_INTERVAL = 0.4  # seconds between wave animation frames (Telegram edit rate limit ~0.3s)
@@ -220,6 +220,8 @@ agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
 _sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 _watchdog_ts: float = time.time()  # updated by heartbeat; checked by OS thread watchdog
+_poll_ts: float = time.time()  # updated by poll monitor; checked by OS thread watchdog
+_app_ref = None  # set in main(), used by poll monitor
 WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
 
 # ── 敏感信息防护 ──
@@ -461,9 +463,12 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
             env=CLAUDE_ENV,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=message.encode("utf-8")), timeout=CLAUDE_TIMEOUT
-            )
+            if CLAUDE_TIMEOUT:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=message.encode("utf-8")), timeout=CLAUDE_TIMEOUT
+                )
+            else:
+                stdout, stderr = await proc.communicate(input=message.encode("utf-8"))
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
@@ -555,24 +560,25 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
         proc.stdin.close()
 
         result = {"error": "No result received", "result": None}
-        deadline = time.monotonic() + CLAUDE_TIMEOUT
-        # Manual line buffer — immune to asyncio's StreamReader limit.
-        # readline() raises ValueError when a single line exceeds `limit`;
-        # reading raw chunks and splitting on \n avoids this entirely.
+        deadline = (time.monotonic() + CLAUDE_TIMEOUT) if CLAUDE_TIMEOUT else None
         buf = b""
 
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                await proc.wait()
-                return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
+            if deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    await proc.wait()
+                    return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
+                read_timeout = min(remaining, 30)
+            else:
+                read_timeout = 30  # still check periodically for EOF
 
             try:
                 chunk = await asyncio.wait_for(
-                    proc.stdout.read(256 * 1024), timeout=min(remaining, 30))
+                    proc.stdout.read(256 * 1024), timeout=read_timeout)
             except asyncio.TimeoutError:
-                if time.monotonic() >= deadline:
+                if deadline and time.monotonic() >= deadline:
                     proc.kill()
                     await proc.wait()
                     return {"error": f"Claude timeout ({CLAUDE_TIMEOUT}s)", "result": None}
@@ -776,17 +782,8 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # P0: Inject Telegram behavior constraints
     augmented_text = TELEGRAM_SYSTEM_CONTEXT + text
 
-    # P2: Smart model routing — downgrade simple queries for speed
     effective_model = None  # None = use active["model"]
     effective_effort = None
-    text_len = len(text)
-    if text_len < 80 and not any(kw in text_lower for kw in [
-        "部署", "deploy", "修复", "fix", "重构", "refactor", "分析", "analyze",
-        "调研", "research", "设计", "design", "实现", "implement", "编写", "write",
-        "创建", "create", "搭建", "build", "迁移", "migrate",
-    ]):
-        effective_model = "sonnet"
-        effective_effort = "low"
 
     active = get_active_project(chat_id_str)
     if not active:
@@ -2337,14 +2334,38 @@ async def _heartbeat_loop():
         await asyncio.sleep(120)
 
 
+async def _poll_monitor():
+    """Check updater health every 30s, update _poll_ts if alive."""
+    global _poll_ts
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if _app_ref and hasattr(_app_ref, 'updater') and _app_ref.updater:
+                if _app_ref.updater.running:
+                    _poll_ts = time.time()
+                else:
+                    log.error("Poll monitor: updater.running=False, forcing restart")
+                    os._exit(1)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 def _start_watchdog_thread():
-    """OS thread watchdog: kills process if asyncio event loop freezes."""
+    """OS thread watchdog: kills process if event loop or polling dies."""
     def _watchdog():
         while True:
             time.sleep(60)
-            stale = time.time() - _watchdog_ts
-            if stale > WATCHDOG_STALE_SEC:
-                log.error(f"Watchdog: event loop frozen for {stale:.0f}s, forcing restart")
+            now = time.time()
+            loop_stale = now - _watchdog_ts
+            poll_stale = now - _poll_ts
+            if loop_stale > WATCHDOG_STALE_SEC:
+                sys.stderr.write(f"[Watchdog] event loop frozen for {loop_stale:.0f}s, forcing restart\n")
+                sys.stderr.flush()
+                os._exit(1)
+            if poll_stale > WATCHDOG_STALE_SEC:
+                sys.stderr.write(f"[Watchdog] polling dead for {poll_stale:.0f}s, forcing restart\n")
+                sys.stderr.flush()
                 os._exit(1)
     t = threading.Thread(target=_watchdog, daemon=True, name="watchdog")
     t.start()
@@ -2451,11 +2472,13 @@ async def post_init(app: Application):
     _create_background_task(_cron_scheduler(app.bot), name="cron-scheduler")
     # Start Uptime Kuma heartbeat
     _create_background_task(_heartbeat_loop(), name="uptime-kuma-heartbeat")
+    # Start poll health monitor
+    _create_background_task(_poll_monitor(), name="poll-monitor")
     log.info("Claude Bridge started")
 
 
 def main():
-    global db, worker_semaphore
+    global db, worker_semaphore, _app_ref
 
     if not CONFIG_PATH.exists():
         print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
@@ -2482,6 +2505,7 @@ def main():
         .build()
     )
 
+    _app_ref = app
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("p", cmd_project))
     app.add_handler(CommandHandler("model", cmd_model))
