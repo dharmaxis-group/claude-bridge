@@ -11,6 +11,7 @@ All notable changes to Claude Bridge are documented here.
 ### Fixed
 - **Model callback validation** — model selection via InlineKeyboard accepted arbitrary values without checking against MODELS whitelist. Now validates `model in MODELS` before writing to DB, consistent with effort/tools handlers
 - **ElevenLabs key exception** — `/el` command crashed with unhandled `CalledProcessError` when Keychain entry was missing. Now catches exception and returns user-friendly error message
+- **UTC+8 timezone for cost queries** — daily budget check, `/cost` today/7-day stats, and inline cost display all used UTC `date('now')`, causing 0:00–8:00 AM local time to count towards the previous day. Now applies `TZ_OFFSET = "+8 hours"` to both `created_at` and `'now'` in all 4 query sites
 
 ## [1.5.0] — 2026-03-13
 
