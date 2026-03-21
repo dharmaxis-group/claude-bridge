@@ -5,5 +5,8 @@
   "dailyBudget": 100.0,
   "defaultModel": "sonnet",
   "defaultToolProfile": "readonly",
-  "claudeBin": "~/.local/bin/claude"
+  "claudeBin": "~/.local/bin/claude",
+  "webhookUrl": "",
+  "webhookPort": 8443,
+  "webhookSecret": ""
 }

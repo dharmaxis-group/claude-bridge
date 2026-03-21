@@ -106,6 +106,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("claude-bridge")
 
+
+class _GetUpdatesTracker(logging.Filter):
+    """Track actual getUpdates HTTP activity via httpx log messages.
+    Also redacts bot token from httpx log output to prevent leaking."""
+    _TOKEN_RE = re.compile(r"/bot[0-9]+:[A-Za-z0-9_-]+/")
+
+    def filter(self, record):
+        global _last_getupdate_ts
+        msg = record.getMessage()
+        if "getUpdates" in msg and "200 OK" in msg:
+            _last_getupdate_ts = time.time()
+        # Redact bot token in logged URLs
+        if "/bot" in msg:
+            record.msg = self._TOKEN_RE.sub("/bot****/", record.getMessage())
+            record.args = None
+        return True
+
+logging.getLogger("httpx").addFilter(_GetUpdatesTracker())
+
 # ── 配置读取 ──
 
 def load_config() -> dict:
@@ -179,6 +198,13 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS context_buffer (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS cron_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id TEXT NOT NULL,
@@ -221,8 +247,14 @@ _sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
 _watchdog_ts: float = time.time()  # updated by heartbeat; checked by OS thread watchdog
 _poll_ts: float = time.time()  # updated by poll monitor; checked by OS thread watchdog
+_last_getupdate_ts: float = 0.0  # 0 = never seen; set by first getUpdates 200 OK
 _app_ref = None  # set in main(), used by poll monitor
+_active_procs: dict[str, asyncio.subprocess.Process] = {}  # chat_id -> running subprocess (for /cancel)
+_cancelled: dict[str, bool] = {}  # chat_id -> cancel requested flag
+_context_buffer: dict[str, list[dict]] = {}  # "chat_id:project" -> [{user, assistant, ts}]
+CONTEXT_BUFFER_SIZE = 8  # keep last N exchanges for session continuity
 WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
+POLL_ACTIVITY_STALE_SEC = 120  # 2 min without actual getUpdates → force restart
 
 # ── 敏感信息防护 ──
 
@@ -384,6 +416,43 @@ def list_projects() -> list[dict]:
     return [{"name": r[0], "path": r[1], "description": r[2]} for r in rows]
 
 
+def _load_context_buffers():
+    """Load context buffers from DB into memory on startup."""
+    rows = db.execute(
+        "SELECT chat_id, project, content FROM context_buffer ORDER BY created_at ASC"
+    ).fetchall()
+    for chat_id, project, content in rows:
+        key = f"{chat_id}:{project}"
+        try:
+            entry = json.loads(content)
+            _context_buffer.setdefault(key, []).append(entry)
+        except json.JSONDecodeError:
+            continue
+    for key in _context_buffer:
+        if len(_context_buffer[key]) > CONTEXT_BUFFER_SIZE:
+            _context_buffer[key] = _context_buffer[key][-CONTEXT_BUFFER_SIZE:]
+
+
+def _save_context_entry(chat_id: str, project: str, entry: dict):
+    """Save a context buffer entry and trim old entries."""
+    db.execute(
+        "INSERT INTO context_buffer (chat_id, project, content) VALUES (?, ?, ?)",
+        (chat_id, project, json.dumps(entry, ensure_ascii=False)),
+    )
+    count = db.execute(
+        "SELECT COUNT(*) FROM context_buffer WHERE chat_id=? AND project=?",
+        (chat_id, project),
+    ).fetchone()[0]
+    if count > CONTEXT_BUFFER_SIZE:
+        db.execute(
+            "DELETE FROM context_buffer WHERE id IN ("
+            "  SELECT id FROM context_buffer WHERE chat_id=? AND project=? "
+            "  ORDER BY created_at ASC LIMIT ?)",
+            (chat_id, project, count - CONTEXT_BUFFER_SIZE),
+        )
+    db.commit()
+
+
 def _parse_interval(s: str) -> int | None:
     """Parse '5m', '1h', '6h', '1d' to seconds. Min 5 minutes."""
     m = re.match(r'^(\d+)(m|h|d)$', s.strip().lower())
@@ -528,7 +597,7 @@ def _format_tool_progress(name: str, input_data: dict) -> str:
 async def invoke_claude_streaming(message: str, project_path: str, session_id: str | None,
                                    model: str, tool_profile: str, effort: str = "medium",
                                    bypass_permissions: bool = False,
-                                   on_tool_use=None) -> dict:
+                                   on_tool_use=None, chat_id: str = None) -> dict:
     """Stream claude -p output via stream-json, calling on_tool_use(name, input) for progress.
     Returns the final result dict (same schema as invoke_claude)."""
     claude_bin = get_claude_bin()
@@ -555,6 +624,8 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
             cwd=project_path,
             env=CLAUDE_ENV,
         )
+        if chat_id:
+            _active_procs[chat_id] = proc
         proc.stdin.write(message.encode("utf-8"))
         await proc.stdin.drain()
         proc.stdin.close()
@@ -620,6 +691,13 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
                             await on_tool_use(block.get("name", ""), block.get("input", {}))
 
         await proc.wait()
+        if chat_id:
+            _active_procs.pop(chat_id, None)
+
+        # Check if cancelled by user (still return result if we got one)
+        if chat_id and _cancelled.pop(chat_id, False):
+            if not result.get("result"):
+                return {"error": "Cancelled by user", "result": None}
 
         if proc.returncode != 0 and not result.get("result"):
             stderr_data = await proc.stderr.read()
@@ -630,6 +708,9 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
         return result
 
     except Exception as e:
+        if chat_id:
+            _active_procs.pop(chat_id, None)
+            _cancelled.pop(chat_id, None)
         log.error(f"invoke_stream error: {e}")
         return {"error": str(e), "result": None}
 
@@ -809,6 +890,21 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     session = get_session(chat_id_str, active["project"])
     session_id = session["session_id"] if session else None
 
+    # Context buffer: inject recent conversation history for new sessions
+    if not session_id:
+        ctx_key = f"{chat_id_str}:{active['project']}"
+        recent = _context_buffer.get(ctx_key, [])
+        if recent:
+            ctx_lines = []
+            for entry in recent[-3:]:
+                ctx_lines.append(f"- User: {entry['user']}")
+                ctx_lines.append(f"  Assistant: {entry['assistant']}")
+            augmented_text = (
+                TELEGRAM_SYSTEM_CONTEXT
+                + "[Previous conversation context:\n" + "\n".join(ctx_lines) + "]\n\n"
+                + text
+            )
+
     if session and (session["turns"] >= SESSION_ROTATE_TURNS or session["cost_usd"] >= SESSION_ROTATE_COST):
         kb = make_keyboard([("New session", "cmd:new"), ("Continue", "cmd:dismiss")], columns=2)
         await update.message.reply_text(
@@ -842,8 +938,12 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except asyncio.TimeoutError:
                 pass
 
+    output_files = []
+
     async def on_tool_use(tool_name: str, tool_input: dict):
         progress_lines.append(_format_tool_progress(tool_name, tool_input))
+        if tool_name == "Write" and tool_input.get("file_path"):
+            output_files.append(tool_input["file_path"])
 
     lock = get_user_lock(chat_id_str)
     async with lock:
@@ -862,6 +962,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     tool_profile=active["tool_profile"],
                     effort=use_effort,
                     on_tool_use=on_tool_use,
+                    chat_id=chat_id_str,
                 )
             finally:
                 stop_typing.set()
@@ -895,7 +996,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Sanitize sensitive data before sending to Telegram
     reply_text = _sanitize_response(chat_id_str, reply_text)
 
-    cost_tag = f"\n\n`{use_model} | {use_effort} | ${cost:.4f} | {duration/1000:.1f}s`"
+    cost_tag = f"\n\n`{active['project']} | {use_model} | {use_effort} | ${cost:.4f} | {duration/1000:.1f}s`"
     full_reply = reply_text + cost_tag
 
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
@@ -903,6 +1004,35 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     # Streaming typing effect: progressively reveal text in the progress message
     await _stream_reply(context.bot, chat_id, full_reply, progress_msg)
+
+    # Auto-send output files (images, small documents)
+    _SENDABLE_IMAGES = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+    _SENDABLE_DOCS = {'.pdf', '.csv', '.xlsx', '.json', '.html'}
+    for fpath in output_files:
+        p = Path(fpath)
+        if not p.exists() or p.stat().st_size > 10 * 1024 * 1024:
+            continue
+        try:
+            if p.suffix.lower() in _SENDABLE_IMAGES:
+                with open(p, 'rb') as f:
+                    await context.bot.send_photo(chat_id=chat_id, photo=f, caption=p.name)
+            elif p.suffix.lower() in _SENDABLE_DOCS:
+                with open(p, 'rb') as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f, caption=p.name)
+        except Exception as e:
+            log.warning(f"Failed to send output file {p.name}: {e}")
+
+    # Save to context buffer for session continuity
+    raw_reply = result.get("result", "")
+    if raw_reply:
+        ctx_key = f"{chat_id_str}:{active['project']}"
+        entry = {"user": text[:300], "assistant": raw_reply[:300], "ts": time.time()}
+        buf = _context_buffer.setdefault(ctx_key, [])
+        buf.append(entry)
+        if len(buf) > CONTEXT_BUFFER_SIZE:
+            _context_buffer[ctx_key] = buf[-CONTEXT_BUFFER_SIZE:]
+        _save_context_entry(chat_id_str, active["project"], entry)
+
     return result.get("result", "")
 
 
@@ -2223,6 +2353,32 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel — cancel running Claude operation or agent"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id_str = str(update.effective_chat.id)
+
+    # Cancel agent if running
+    running = agent_running.get(chat_id_str)
+    if running:
+        running["cancel"].set()
+
+    # Kill active subprocess
+    proc = _active_procs.get(chat_id_str)
+    if proc:
+        _cancelled[chat_id_str] = True
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await update.message.reply_text("Cancelling...")
+    elif running:
+        await update.message.reply_text("Stopping agent...")
+    else:
+        await update.message.reply_text("Nothing running.")
+
+
 # ── /cron 定时任务 ──
 
 async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2352,19 +2508,29 @@ async def _poll_monitor():
 
 
 def _start_watchdog_thread():
-    """OS thread watchdog: kills process if event loop or polling dies."""
+    """OS thread watchdog: kills process if event loop or polling dies.
+    Three independent checks — any one stale triggers restart:
+    1. _watchdog_ts: heartbeat loop (event loop alive)
+    2. _poll_ts: poll monitor (updater.running property)
+    3. _last_getupdate_ts: actual getUpdates HTTP calls (ground truth)
+    """
     def _watchdog():
         while True:
             time.sleep(60)
             now = time.time()
             loop_stale = now - _watchdog_ts
             poll_stale = now - _poll_ts
+            http_stale = now - _last_getupdate_ts
             if loop_stale > WATCHDOG_STALE_SEC:
                 sys.stderr.write(f"[Watchdog] event loop frozen for {loop_stale:.0f}s, forcing restart\n")
                 sys.stderr.flush()
                 os._exit(1)
             if poll_stale > WATCHDOG_STALE_SEC:
                 sys.stderr.write(f"[Watchdog] polling dead for {poll_stale:.0f}s, forcing restart\n")
+                sys.stderr.flush()
+                os._exit(1)
+            if _last_getupdate_ts > 0 and http_stale > POLL_ACTIVITY_STALE_SEC:
+                sys.stderr.write(f"[Watchdog] no getUpdates HTTP for {http_stale:.0f}s, forcing restart\n")
                 sys.stderr.flush()
                 os._exit(1)
     t = threading.Thread(target=_watchdog, daemon=True, name="watchdog")
@@ -2465,6 +2631,7 @@ async def post_init(app: Application):
         BotCommand("el", "ElevenLabs account"),
         BotCommand("restart", "Restart CB service"),
         BotCommand("agent", "Autonomous agent loop"),
+        BotCommand("cancel", "Cancel running operation"),
         BotCommand("cron", "Scheduled tasks"),
         BotCommand("help", "Help"),
     ])
@@ -2494,6 +2661,7 @@ def main():
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = init_db()
+    _load_context_buffers()
     worker_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
 
     app = (
@@ -2521,6 +2689,7 @@ def main():
     app.add_handler(CommandHandler("el", cmd_el))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("cron", cmd_cron))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
@@ -2531,9 +2700,24 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _start_watchdog_thread()
-    log.info(f"Starting with proxy={proxy}, allowed={cfg.get('allowFrom', [])}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,
-                     bootstrap_retries=-1)
+
+    webhook_url = cfg.get("webhookUrl")
+    if webhook_url:
+        webhook_port = int(cfg.get("webhookPort", 8443))
+        webhook_secret = cfg.get("webhookSecret", "")
+        log.info(f"Starting webhook mode on port {webhook_port}, url={webhook_url}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=webhook_port,
+            url_path=token,
+            webhook_url=f"{webhook_url}/{token}",
+            secret_token=webhook_secret,
+            drop_pending_updates=True,
+        )
+    else:
+        log.info(f"Starting polling mode, proxy={proxy}, allowed={cfg.get('allowFrom', [])}")
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True,
+                         bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

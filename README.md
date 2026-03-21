@@ -19,11 +19,15 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 - **`/cron` scheduled tasks** — register recurring prompts on a schedule (add/list/rm/pause/resume)
 - **Cost tracking** — daily budget (configurable via `/budget`), per-project cost breakdown, `/cost` command
 - **Sensitive data masking** — passwords and tokens in user input are automatically masked in responses, sensitive messages auto-deleted
-- **Smart model routing** — short simple queries auto-downgrade to Sonnet for faster responses
+- **`/cancel` command** — terminate a running Claude operation mid-flight
+- **Auto-send output files** — images and documents created by Claude are automatically sent back to Telegram
+- **Context continuity** — recent conversation history persists across session rotations
 - **ElevenLabs management** — `/el` command for account dashboard (credits, voice slots, billing)
 - **`/task` orchestration** — two-phase execution: readonly analysis first, then confirm to execute with full tools
 - **InlineKeyboard UI** — interactive buttons for project selection, model switching, tool permissions
 - **Tool permission profiles** — readonly (default), standard, restricted
+- **Triple-layer watchdog** — event loop heartbeat + polling monitor + HTTP activity tracker, auto-restart on any failure
+- **Webhook support** — optional webhook mode (add `webhookUrl` to config); defaults to polling
 - **LaunchAgent integration** — auto-start on boot, auto-restart on crash (macOS)
 
 ## Architecture
@@ -32,7 +36,7 @@ A lightweight bridge service that connects Telegram to `claude -p` (Claude Code'
 User (Telegram App)
     |
     v  Telegram Bot API (HTTPS)
-Claude Bridge (Python, ~2400 lines)
+Claude Bridge (Python, ~2700 lines)
     |
     v  subprocess stdin/stdout (JSON)
 Claude Code CLI (claude -p --output-format json)

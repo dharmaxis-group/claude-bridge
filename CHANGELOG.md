@@ -2,6 +2,22 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [Unreleased]
+
+### Security
+- **Bot Token log redaction** — httpx logs now mask bot token as `bot****/` via `_GetUpdatesTracker` filter. Cleaned 64,645 historical occurrences from existing log files
+- **GitHub repo set to PRIVATE** — temporarily unpublished from public access
+
+### Added
+- **`/cancel` command** — terminate running Claude operation or agent (`proc.kill()` + cancel event)
+- **Auto-send output files** — images/documents written by Claude are automatically sent to Telegram (PNG/JPG/PDF/CSV etc., 10MB limit)
+- **Context buffer** — persists last 8 conversation exchanges per project in SQLite `context_buffer` table; injects last 3 into new sessions for continuity
+- **Webhook mode** — add `webhookUrl` to config.json to switch from polling to webhook; defaults to polling when absent
+- **Third-layer watchdog** — HTTP-level `getUpdates` activity monitor via httpx log filter; forces restart if no HTTP activity for 2 minutes
+
+### Changed
+- **Cost tag includes project name** — footer shows `project | model | effort | $cost | time`
+
 ## [1.6.0] — 2026-03-18
 
 ### Added
