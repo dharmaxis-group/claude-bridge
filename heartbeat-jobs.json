@@ -1,0 +1,38 @@
+{
+  "jobs": [
+    {
+      "id": "github-watch",
+      "name": "GitHub Repo 监控",
+      "schedule": "17 10 * * 1",
+      "type": "script",
+      "command": "python3 ~/.claude-bridge/scripts/github-watch.py",
+      "enabled": true,
+      "notify": false,
+      "notify_on_error": true,
+      "self_notify": true,
+      "timeout": 120
+    },
+    {
+      "id": "system-health",
+      "name": "系统健康",
+      "schedule": "0 */6 * * *",
+      "type": "script",
+      "command": "python3 ~/.claude-bridge/scripts/system-health.py",
+      "enabled": true,
+      "notify": true,
+      "timeout": 30
+    },
+    {
+      "id": "cb-watchdog",
+      "name": "CB 存活检测",
+      "schedule": "*/5 * * * *",
+      "type": "script",
+      "command": "python3 ~/.claude-bridge/scripts/cb-watchdog.py",
+      "enabled": true,
+      "notify": false,
+      "notify_on_error": true,
+      "self_notify": true,
+      "timeout": 30
+    }
+  ]
+}

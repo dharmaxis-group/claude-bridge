@@ -152,7 +152,7 @@ def get_claude_bin() -> Path:
 
 def get_proxy() -> str:
     cfg = load_config()
-    return cfg.get("proxy", "http://127.0.0.1:1082")
+    return cfg.get("proxy", "") or None
 
 
 # ── SQLite ──
@@ -1159,7 +1159,7 @@ async def _tts_elevenlabs(clean: str, mp3_path, ogg_path, voice_name: str):
     import httpx
     voice_id = ELEVENLABS_VOICES.get(voice_name, "EXAVITQu4vr4xnSDxMaL")
     api_key = _get_elevenlabs_key()
-    async with httpx.AsyncClient(proxy="http://127.0.0.1:1082", timeout=30) as client:
+    async with httpx.AsyncClient(proxy=get_proxy(), timeout=30) as client:
         resp = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
             headers={"xi-api-key": api_key, "Content-Type": "application/json"},
@@ -1568,7 +1568,7 @@ async def cmd_el(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ElevenLabs API key not found in Keychain.")
         return
     try:
-        async with httpx.AsyncClient(proxy="http://127.0.0.1:1082", timeout=15) as client:
+        async with httpx.AsyncClient(proxy=get_proxy(), timeout=15) as client:
             resp = await client.get(
                 "https://api.elevenlabs.io/v1/user/subscription",
                 headers={"xi-api-key": api_key},
@@ -2340,6 +2340,86 @@ async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=f"agent-{chat_id_str}")
 
 
+# ── /health, /sleep, /work, /cleanup ── Scene Commands ──
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/health — system health report"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    try:
+        r = subprocess.run(
+            [sys.executable, str(CB_HOME / "scripts" / "system-health.py")],
+            capture_output=True, text=True, timeout=15,
+        )
+        output = r.stdout.strip() or r.stderr.strip() or "No output"
+        await update.message.reply_text(f"```\n{output}\n```", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"Health check failed: {e}")
+
+
+async def cmd_sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sleep — lock screen + lower volume"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    cmds = [
+        "osascript -e 'set volume output volume 30'",
+        "pmset displaysleepnow",
+    ]
+    for cmd in cmds:
+        subprocess.run(cmd, shell=True, capture_output=True)
+    await update.message.reply_text("Good night. Screen locked, volume 30%.")
+
+
+async def cmd_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/work — open work apps"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    apps = ["Google Chrome", "Visual Studio Code", "Telegram"]
+    for app in apps:
+        subprocess.run(["open", "-a", app], capture_output=True)
+    await update.message.reply_text(f"Work mode. Opened: {', '.join(apps)}")
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleanup — auto-organize desktop files"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    await update.message.reply_text("Scanning Desktop...")
+    desktop = Path.home() / "Desktop"
+    categories = {
+        "Screenshots": [".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic"],
+        "Documents": [".pdf", ".doc", ".docx", ".txt", ".rtf", ".pages", ".xlsx", ".csv"],
+        "Archives": [".zip", ".tar", ".gz", ".rar", ".7z", ".dmg"],
+        "Videos": [".mp4", ".mov", ".avi", ".mkv"],
+        "Code": [".py", ".js", ".ts", ".html", ".css", ".json", ".yaml", ".yml", ".sh"],
+    }
+    moved = {}
+    for f in desktop.iterdir():
+        if f.name.startswith(".") or f.is_dir():
+            continue
+        ext = f.suffix.lower()
+        target_cat = None
+        for cat, exts in categories.items():
+            if ext in exts:
+                target_cat = cat
+                break
+        if not target_cat:
+            continue
+        target_dir = desktop / target_cat
+        target_dir.mkdir(exist_ok=True)
+        dest = target_dir / f.name
+        if dest.exists():
+            dest = target_dir / f"{f.stem}_{int(time.time())}{f.suffix}"
+        f.rename(dest)
+        moved[target_cat] = moved.get(target_cat, 0) + 1
+
+    if moved:
+        report = "\n".join(f"  {cat}: {n} files" for cat, n in sorted(moved.items()))
+        await update.message.reply_text(f"Cleanup done:\n```\n{report}\n```", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("Desktop clean, nothing to organize.")
+
+
 # ── /restart ──
 
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2633,6 +2713,10 @@ async def post_init(app: Application):
         BotCommand("agent", "Autonomous agent loop"),
         BotCommand("cancel", "Cancel running operation"),
         BotCommand("cron", "Scheduled tasks"),
+        BotCommand("health", "System health"),
+        BotCommand("sleep", "Lock screen + lower volume"),
+        BotCommand("work", "Open work apps"),
+        BotCommand("cleanup", "Organize desktop"),
         BotCommand("help", "Help"),
     ])
     # Start cron scheduler background task
@@ -2691,6 +2775,10 @@ def main():
     app.add_handler(CommandHandler("agent", cmd_agent))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("cron", cmd_cron))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("sleep", cmd_sleep))
+    app.add_handler(CommandHandler("work", cmd_work))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
