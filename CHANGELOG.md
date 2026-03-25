@@ -4,6 +4,10 @@ All notable changes to Claude Bridge are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Telegram 429 rate limit loop** — wave animation was editing messages every 0.4s (~150/min), far exceeding Telegram's ~30/min limit. Added exponential backoff (2x, max 30s) on 429 errors, increased base interval to 3s. Also added 429 backoff to `_stream_reply` progressive text reveal
+- **Runaway session prevention** — `CLAUDE_TIMEOUT` changed from `None` (unlimited) to `3600` (1 hour max). Observed a 13+ hour stuck session causing 3,000+ rate limit errors
+
 ### Security
 - **Bot Token log redaction** — httpx logs now mask bot token as `bot****/` via `_GetUpdatesTracker` filter. Cleaned 64,645 historical occurrences from existing log files
 - **GitHub repo set to PRIVATE** — temporarily unpublished from public access

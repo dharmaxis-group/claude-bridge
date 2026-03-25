@@ -42,13 +42,13 @@ TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
 DAILY_BUDGET_USD = 100.0
-CLAUDE_TIMEOUT = None  # no timeout — remote maintenance via phone needs long-running tasks
+CLAUDE_TIMEOUT = 3600  # 1 hour max — prevents runaway sessions; use /cancel for longer tasks
 PROGRESS_EDIT_INTERVAL = 3.0  # min seconds between Telegram progress message edits
 TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
 DEFAULT_EFFORT = "high"
 VALID_EFFORTS = {"low", "medium", "high"}
 WAVE_FRAMES = ["◉ ◌ ◌", "◌ ◉ ◌", "◌ ◌ ◉", "◌ ◉ ◌"]
-WAVE_INTERVAL = 0.4  # seconds between wave animation frames (Telegram edit rate limit ~0.3s)
+WAVE_INTERVAL = 3.0  # seconds between wave animation frames (Telegram rate limit ~30 edits/min)
 
 # ── Agent Loop 常量 ──
 AGENT_PHASE_TIMEOUT = 600       # 10 min per phase
@@ -820,11 +820,15 @@ async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
         display = text[:pos] + (cursor if pos < len(text) else "")
         try:
             await msg.edit_text(display, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            try:
-                await msg.edit_text(display)
-            except Exception:
-                pass
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "Too Many Requests" in err_str or "Flood" in err_str:
+                await asyncio.sleep(5.0)  # back off on rate limit
+            else:
+                try:
+                    await msg.edit_text(display)
+                except Exception:
+                    pass
 
         chunk_size = min(chunk_size * STREAM_ACCEL, STREAM_MAX_CHUNK)
         if pos < len(text):
@@ -832,13 +836,19 @@ async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
 
     # Final edit without cursor (if cursor was shown)
     if cursor in (text[:pos] + cursor):
-        try:
-            await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
+        for _attempt in range(3):
             try:
-                await msg.edit_text(text)
-            except Exception:
-                pass
+                await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+                break
+            except Exception as e:
+                if "429" in str(e) or "Too Many Requests" in str(e) or "Flood" in str(e):
+                    await asyncio.sleep(5.0)
+                else:
+                    try:
+                        await msg.edit_text(text)
+                    except Exception:
+                        pass
+                    break
 
 
 async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -920,6 +930,7 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     async def _wave_animation():
         """Animate wave dots + tool progress on the progress message."""
         frame_idx = 0
+        backoff = WAVE_INTERVAL
         while not stop_wave.is_set():
             frame_idx += 1
             wave = WAVE_FRAMES[frame_idx % len(WAVE_FRAMES)]
@@ -930,10 +941,14 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 text = wave
             try:
                 await progress_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                pass
+                backoff = WAVE_INTERVAL  # reset on success
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "Too Many Requests" in err_str or "Flood" in err_str:
+                    backoff = min(backoff * 2, 30.0)  # exponential backoff, max 30s
+                # else: transient error, keep current interval
             try:
-                await asyncio.wait_for(stop_wave.wait(), timeout=WAVE_INTERVAL)
+                await asyncio.wait_for(stop_wave.wait(), timeout=backoff)
                 break
             except asyncio.TimeoutError:
                 pass
@@ -2697,26 +2712,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
+        # ── 高频：核心工作流 ──
         BotCommand("p", "Projects"),
-        BotCommand("model", "Select model"),
-        BotCommand("effort", "Thinking depth"),
-        BotCommand("think", "Opus + deep thinking"),
-        BotCommand("tools", "Tool access"),
         BotCommand("new", "New session"),
+        BotCommand("cancel", "Cancel running operation"),
         BotCommand("status", "Status & settings"),
-        BotCommand("cost", "Cost summary"),
+        BotCommand("model", "Select model"),
         BotCommand("task", "Readonly analyze, then execute"),
+        # ── 中频：调优 ──
+        BotCommand("think", "Opus + deep thinking"),
+        BotCommand("effort", "Thinking depth"),
+        BotCommand("tools", "Tool access"),
+        BotCommand("cost", "Cost summary"),
+        BotCommand("agent", "Autonomous agent loop"),
+        # ── 低频：设置/监控 ──
+        BotCommand("health", "System health"),
         BotCommand("budget", "Daily budget settings"),
+        BotCommand("cron", "Scheduled tasks"),
         BotCommand("voice", "Voice reply settings"),
         BotCommand("el", "ElevenLabs account"),
-        BotCommand("restart", "Restart CB service"),
-        BotCommand("agent", "Autonomous agent loop"),
-        BotCommand("cancel", "Cancel running operation"),
-        BotCommand("cron", "Scheduled tasks"),
-        BotCommand("health", "System health"),
+        # ── 偶尔：Mac 控制/元操作 ──
         BotCommand("sleep", "Lock screen + lower volume"),
         BotCommand("work", "Open work apps"),
         BotCommand("cleanup", "Organize desktop"),
+        BotCommand("restart", "Restart CB service"),
         BotCommand("help", "Help"),
     ])
     # Start cron scheduler background task
