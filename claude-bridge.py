@@ -922,8 +922,18 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb,
         )
 
-    # Progress message with wave animation
-    progress_msg = await update.message.reply_text(WAVE_FRAMES[0])
+    # Progress message with wave animation (retry on network timeout)
+    progress_msg = None
+    for _retry in range(3):
+        try:
+            progress_msg = await update.message.reply_text(WAVE_FRAMES[0])
+            break
+        except Exception as e:
+            if _retry < 2:
+                log.warning(f"reply_text retry {_retry+1}/3: {e}")
+                await asyncio.sleep(2.0)
+            else:
+                raise
     progress_lines = []
     stop_wave = asyncio.Event()
 
@@ -991,7 +1001,13 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await progress_msg.delete()
         except Exception:
             pass
-        await update.message.reply_text(f"Error: {result['error'][:500]}")
+        for _r in range(3):
+            try:
+                await update.message.reply_text(f"Error: {result['error'][:500]}")
+                break
+            except Exception:
+                if _r < 2:
+                    await asyncio.sleep(2.0)
         return None
 
     reply_text = result.get("result", "")
@@ -1348,14 +1364,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"handle_message: chat_id={update.effective_chat.id if update.effective_chat else 'None'}, "
+             f"has_message={bool(update.message)}, has_text={bool(update.message and update.message.text)}")
     if not update.message or not update.message.text:
+        log.info("handle_message: no message or text, returning")
         return
     if not is_allowed(update.effective_chat.id):
+        log.info(f"handle_message: chat_id {update.effective_chat.id} not allowed")
         return
 
     text = update.message.text.strip()
     if not text:
+        log.info("handle_message: empty text after strip")
         return
+    log.info(f"handle_message: processing text='{text[:50]}...' from {update.effective_chat.id}")
 
     # Intercept budget amount input
     if context.user_data.get("awaiting_budget"):
@@ -2770,8 +2792,12 @@ def main():
     app = (
         Application.builder()
         .token(token)
-        .request(HTTPXRequest(connection_pool_size=16, pool_timeout=30.0, proxy=proxy))
-        .get_updates_request(HTTPXRequest(connection_pool_size=4, pool_timeout=10.0, proxy=proxy))
+        .request(HTTPXRequest(connection_pool_size=16, pool_timeout=30.0,
+                             connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
+                             proxy=proxy))
+        .get_updates_request(HTTPXRequest(connection_pool_size=4, pool_timeout=10.0,
+                                          connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
+                                          proxy=proxy))
         .post_init(post_init)
         .build()
     )
