@@ -694,10 +694,9 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
         if chat_id:
             _active_procs.pop(chat_id, None)
 
-        # Check if cancelled by user (still return result if we got one)
+        # Check if cancelled by user — always honour cancel regardless of partial result
         if chat_id and _cancelled.pop(chat_id, False):
-            if not result.get("result"):
-                return {"error": "Cancelled by user", "result": None}
+            return {"error": "Cancelled by user", "result": None}
 
         if proc.returncode != 0 and not result.get("result"):
             stderr_data = await proc.stderr.read()
@@ -2067,7 +2066,8 @@ def _extract_json(text: str) -> dict | None:
 
 async def _agent_invoke(message: str, project_path: str, session_id: str | None,
                         model: str, tool_profile: str, effort: str = "high",
-                        max_turns: int = 50, timeout: int = 600) -> dict:
+                        max_turns: int = 50, timeout: int = 600,
+                        chat_id: str = None) -> dict:
     """Claude invocation with agent-specific limits. Uses stdin + JSON array parsing."""
     claude_bin = get_claude_bin()
     cmd = [
@@ -2095,6 +2095,8 @@ async def _agent_invoke(message: str, project_path: str, session_id: str | None,
             cwd=project_path,
             env=CLAUDE_ENV,
         )
+        if chat_id:
+            _active_procs[chat_id] = proc
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=message.encode("utf-8")), timeout=timeout)
@@ -2102,6 +2104,13 @@ async def _agent_invoke(message: str, project_path: str, session_id: str | None,
             proc.kill()
             await proc.wait()
             return {"error": f"Timeout ({timeout}s)", "result": None}
+        finally:
+            if chat_id:
+                _active_procs.pop(chat_id, None)
+
+        # Honour cancel — process was killed by /cancel
+        if chat_id and _cancelled.pop(chat_id, False):
+            return {"error": "Cancelled by user", "result": None}
 
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace").strip()
@@ -2122,6 +2131,9 @@ async def _agent_invoke(message: str, project_path: str, session_id: str | None,
     except json.JSONDecodeError as e:
         return {"error": f"JSON parse: {e}", "result": raw[:500] if raw else None}
     except Exception as e:
+        if chat_id:
+            _active_procs.pop(chat_id, None)
+            _cancelled.pop(chat_id, None)
         log.error(f"agent_invoke error: {e}")
         return {"error": str(e), "result": None}
 
@@ -2159,7 +2171,8 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
 
         plan_result = _safe_result(await _agent_invoke(
             plan_prompt, project_path, None, model, "readonly",
-            effort="high", max_turns=AGENT_PLAN_MAX_TURNS, timeout=120))
+            effort="high", max_turns=AGENT_PLAN_MAX_TURNS, timeout=120,
+            chat_id=chat_id_str))
 
         if plan_result.get("error"):
             await context.bot.send_message(
@@ -2228,9 +2241,14 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
                 exec_prompt, project_path, session_id, model, tp,
                 effort="high",
                 max_turns=min(est * 2, AGENT_PHASE_MAX_TURNS),
-                timeout=AGENT_PHASE_TIMEOUT))
+                timeout=AGENT_PHASE_TIMEOUT,
+                chat_id=chat_id_str))
 
             if exec_result.get("error"):
+                # If cancelled, stop immediately — don't continue to next phase
+                if "Cancelled by user" in exec_result["error"]:
+                    await context.bot.send_message(chat_id=chat_id, text="⏹ Agent 已停止")
+                    return
                 phase_results.append({
                     "phase": phase_num, "title": phase["title"],
                     "status": "failed", "error": exec_result["error"][:200]})
@@ -2280,7 +2298,8 @@ async def run_agent_loop(chat_id_str: str, project_path: str, model: str,
 
             verify_result = _safe_result(await _agent_invoke(
                 verify_prompt, project_path, None, model, "readonly",
-                effort="medium", max_turns=AGENT_VERIFY_MAX_TURNS, timeout=120))
+                effort="medium", max_turns=AGENT_VERIFY_MAX_TURNS, timeout=120,
+                chat_id=chat_id_str))
 
             total_cost += verify_result.get("total_cost_usd", 0)
             total_turns += verify_result.get("num_turns", 0)

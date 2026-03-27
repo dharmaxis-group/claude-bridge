@@ -5,6 +5,7 @@ All notable changes to Claude Bridge are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **`/cancel` actually stops running tasks** — three bugs prevented `/cancel` from working: (1) normal messages: partial results were still sent after kill; (2) agent mode: subprocess not registered in `_active_procs`, so `proc.kill()` couldn't reach it; (3) agent exec loop continued to next phase after cancel. All three fixed
 - **Telegram 429 rate limit loop** — wave animation was editing messages every 0.4s (~150/min), far exceeding Telegram's ~30/min limit. Added exponential backoff (2x, max 30s) on 429 errors, increased base interval to 3s. Also added 429 backoff to `_stream_reply` progressive text reveal
 - **Runaway session prevention** — `CLAUDE_TIMEOUT` changed from `None` (unlimited) to `3600` (1 hour max). Observed a 13+ hour stuck session causing 3,000+ rate limit errors
 
