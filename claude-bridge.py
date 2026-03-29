@@ -37,7 +37,7 @@ VOICE_DIR = CB_HOME / "data" / "voice"
 
 DEFAULT_MODEL = "opus"
 MAX_TURNS = 50  # enough for complex tasks like sync/review
-MAX_CONCURRENT_WORKERS = 2
+MAX_CONCURRENT_WORKERS = 4
 TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
@@ -127,7 +127,15 @@ logging.getLogger("httpx").addFilter(_GetUpdatesTracker())
 
 # ── 配置读取 ──
 
-def load_config() -> dict:
+_config_cache: dict | None = None
+
+
+def load_config(force_reload: bool = False) -> dict:
+    """Load config with caching. Shell expansion runs once at first load."""
+    global _config_cache
+    if _config_cache is not None and not force_reload:
+        return _config_cache
+
     import subprocess as _sp
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
@@ -138,10 +146,14 @@ def load_config() -> dict:
         if isinstance(v, str) and v.startswith("!"):
             cmd = v[1:]
             try:
-                cfg[k] = _sp.check_output(cmd, shell=True, text=True).strip()
+                cfg[k] = _sp.check_output(cmd, shell=True, text=True, timeout=10).strip()
             except _sp.CalledProcessError as e:
                 print(f"Shell expansion failed for {k}: {e}", file=sys.stderr)
                 sys.exit(1)
+            except _sp.TimeoutExpired:
+                print(f"Shell expansion timed out for {k}: {cmd}", file=sys.stderr)
+                sys.exit(1)
+    _config_cache = cfg
     return cfg
 
 
@@ -759,9 +771,22 @@ STREAM_MAX_CHUNK = 200       # max chars per edit step
 STREAM_MSG_LIMIT = 3800      # start new message before hitting Telegram 4096 limit
 
 
+def _is_msg_gone(e: Exception) -> bool:
+    """Check if a Telegram error means the message no longer exists."""
+    s = str(e).lower()
+    return "message to edit not found" in s or "message can't be edited" in s or "message not found" in s
+
+
+def _is_network_error(e: Exception) -> bool:
+    """Check if the error is a transient network issue."""
+    s = str(e).lower()
+    return "connecterror" in s or "networkerror" in s or "timed out" in s or "timeout" in s
+
+
 async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
     """Progressively reveal text in a Telegram message (typing effect).
-    If reuse_msg is provided, edits that message; otherwise creates a new one."""
+    If reuse_msg is provided, edits that message; otherwise creates a new one.
+    On persistent failures, falls back to send_long_message for delivery guarantee."""
     if not text or not text.strip():
         if reuse_msg:
             try:
@@ -774,16 +799,28 @@ async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
     pos = 0
     chunk_size = float(STREAM_INITIAL_CHUNK)
     msg = reuse_msg
+    _consecutive_failures = 0
+    _MAX_CONSECUTIVE_FAILURES = 5  # after this many, abandon streaming and send plainly
 
     # First edit: clear progress content, show cursor
     if msg:
         try:
             await msg.edit_text(cursor)
-        except Exception:
-            msg = None
+        except Exception as e:
+            if _is_msg_gone(e):
+                msg = None  # message deleted by user, create new one
+            else:
+                msg = None
 
     if not msg:
-        msg = await bot.send_message(chat_id=chat_id, text=cursor)
+        try:
+            msg = await bot.send_message(chat_id=chat_id, text=cursor)
+        except Exception as e:
+            # Cannot even send a new message — direct fallback
+            log.warning(f"_stream_reply: cannot create message: {e}")
+            await asyncio.sleep(3.0)
+            await send_long_message(bot, chat_id, text)
+            return
 
     while pos < len(text):
         step = int(chunk_size)
@@ -813,21 +850,48 @@ async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
             text = text[pos:]
             pos = 0
             chunk_size = float(STREAM_INITIAL_CHUNK)
-            msg = await bot.send_message(chat_id=chat_id, text=cursor)
+            _consecutive_failures = 0
+            try:
+                msg = await bot.send_message(chat_id=chat_id, text=cursor)
+            except Exception:
+                await asyncio.sleep(3.0)
+                await send_long_message(bot, chat_id, text)
+                return
             continue
 
         display = text[:pos] + (cursor if pos < len(text) else "")
         try:
             await msg.edit_text(display, parse_mode=ParseMode.MARKDOWN)
+            _consecutive_failures = 0
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "Too Many Requests" in err_str or "Flood" in err_str:
                 await asyncio.sleep(5.0)  # back off on rate limit
+            elif _is_msg_gone(e):
+                # Message deleted by user — send remaining text as new message
+                log.info(f"_stream_reply: message deleted by user, fallback to send_long_message")
+                remaining = text[pos:] if pos < len(text) else text
+                await send_long_message(bot, chat_id, remaining)
+                return
+            elif _is_network_error(e):
+                _consecutive_failures += 1
+                log.warning(f"_stream_reply: network error ({_consecutive_failures}/{_MAX_CONSECUTIVE_FAILURES}): {e}")
+                if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    log.warning("_stream_reply: too many network failures, fallback to send_long_message")
+                    await asyncio.sleep(5.0)
+                    await send_long_message(bot, chat_id, text)
+                    return
+                await asyncio.sleep(3.0)
             else:
                 try:
                     await msg.edit_text(display)
-                except Exception:
-                    pass
+                    _consecutive_failures = 0
+                except Exception as inner_e:
+                    if _is_msg_gone(inner_e):
+                        remaining = text[pos:] if pos < len(text) else text
+                        await send_long_message(bot, chat_id, remaining)
+                        return
+                    _consecutive_failures += 1
 
         chunk_size = min(chunk_size * STREAM_ACCEL, STREAM_MAX_CHUNK)
         if pos < len(text):
@@ -842,11 +906,19 @@ async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e) or "Flood" in str(e):
                     await asyncio.sleep(5.0)
+                elif _is_msg_gone(e):
+                    await send_long_message(bot, chat_id, text)
+                    break
+                elif _is_network_error(e) and _attempt == 2:
+                    await asyncio.sleep(5.0)
+                    await send_long_message(bot, chat_id, text)
+                    break
                 else:
                     try:
                         await msg.edit_text(text)
                     except Exception:
-                        pass
+                        if _attempt == 2:
+                            await send_long_message(bot, chat_id, text)
                     break
 
 
@@ -921,6 +993,15 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb,
         )
 
+    # P0: Feedback guarantee — notify user if blocked by lock or semaphore
+    lock = get_user_lock(chat_id_str)
+    if lock.locked():
+        try:
+            await update.message.reply_text("Previous request still running, queued...")
+        except Exception:
+            pass
+        log.info(f"user {chat_id_str} queued behind per-user lock")
+
     # Progress message with wave animation (retry on network timeout)
     progress_msg = None
     for _retry in range(3):
@@ -969,8 +1050,14 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if tool_name == "Write" and tool_input.get("file_path"):
             output_files.append(tool_input["file_path"])
 
-    lock = get_user_lock(chat_id_str)
     async with lock:
+        # P1: Notify if all workers busy
+        if worker_semaphore._value == 0:
+            try:
+                await progress_msg.edit_text("System busy, waiting for a slot...")
+            except Exception:
+                pass
+            log.info(f"user {chat_id_str} queued behind worker semaphore ({MAX_CONCURRENT_WORKERS} workers full)")
         async with worker_semaphore:
             stop_typing = asyncio.Event()
             typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))

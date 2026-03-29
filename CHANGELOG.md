@@ -4,6 +4,9 @@ All notable changes to Claude Bridge are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Protected directory guard for headless mode** — `~/.claude/` is a hardcoded protected directory where Edit/Write tools block in `-p` mode waiting for interactive approval. New two-layer system: (1) CLAUDE.md rule instructs Claude to use Bash tools instead; (2) `protected-dir-guard.py` PreToolUse hook intercepts Edit/Write targeting `~/.claude/*` and returns actionable Bash alternatives (exit 2 block + stderr guidance). Enables full Telegram Bot operation without `--dangerously-skip-permissions`
+
 ### Fixed
 - **`/cancel` actually stops running tasks** — three bugs prevented `/cancel` from working: (1) normal messages: partial results were still sent after kill; (2) agent mode: subprocess not registered in `_active_procs`, so `proc.kill()` couldn't reach it; (3) agent exec loop continued to next phase after cancel. All three fixed
 - **Telegram 429 rate limit loop** — wave animation was editing messages every 0.4s (~150/min), far exceeding Telegram's ~30/min limit. Added exponential backoff (2x, max 30s) on 429 errors, increased base interval to 3s. Also added 429 backoff to `_stream_reply` progressive text reveal
