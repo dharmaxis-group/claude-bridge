@@ -47,6 +47,15 @@ def send_telegram(message: str):
         pass
 
 
+def is_launchd_managed() -> bool:
+    """Check if ai.claude-bridge is loaded in launchd."""
+    r = subprocess.run(
+        ["launchctl", "list", LABEL],
+        capture_output=True, text=True
+    )
+    return r.returncode == 0
+
+
 def main():
     # 检查进程是否存在
     r = subprocess.run(
@@ -56,19 +65,25 @@ def main():
     pids = [p for p in r.stdout.strip().split("\n") if p]
 
     if not pids:
-        print("CB process not found, attempting restart")
-        send_telegram("CB Watchdog: claude-bridge.py 进程不存在，正在重启...")
-        subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"],
-            capture_output=True, text=True
-        )
-        time.sleep(3)
-        # 验证重启
-        r2 = subprocess.run(["pgrep", "-f", "claude-bridge.py"], capture_output=True, text=True)
-        if r2.stdout.strip():
-            send_telegram("CB Watchdog: 重启成功")
+        if is_launchd_managed():
+            # launchd KeepAlive 会自动重启，只报告不干预
+            print("CB process not found, launchd KeepAlive will handle restart")
+            send_telegram("CB Watchdog: 进程不存在，等待 launchd 自动重启...")
         else:
-            send_telegram("CB Watchdog: 重启失败，需要手动检查")
+            # launchd 未加载，bootstrap 并启动
+            print("CB process not found and launchd not loaded, bootstrapping...")
+            send_telegram("CB Watchdog: 进程不存在且 launchd 未加载，正在 bootstrap...")
+            plist = os.path.expanduser("~/Library/LaunchAgents/ai.claude-bridge.plist")
+            subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", plist],
+                capture_output=True, text=True
+            )
+            time.sleep(3)
+            r2 = subprocess.run(["pgrep", "-f", "claude-bridge.py"], capture_output=True, text=True)
+            if r2.stdout.strip():
+                send_telegram("CB Watchdog: bootstrap 成功")
+            else:
+                send_telegram("CB Watchdog: bootstrap 失败，需要手动检查")
         sys.exit(1)
 
     # 检查日志活跃度
@@ -77,11 +92,15 @@ def main():
         stale = time.time() - mtime
         if stale > STALE_THRESHOLD:
             print(f"CB log stale for {stale:.0f}s, may be frozen")
-            send_telegram(f"CB Watchdog: 日志 {stale/60:.0f} 分钟无更新，可能僵死，尝试重启...")
-            subprocess.run(
-                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LABEL}"],
-                capture_output=True, text=True
-            )
+            if is_launchd_managed():
+                # launchd 管理：用 kickstart -k 让 launchd 重启（不产生孤儿进程）
+                send_telegram(f"CB Watchdog: 日志 {stale/60:.0f} 分钟无更新，launchd kickstart 重启...")
+                subprocess.run(
+                    ["launchctl", "kickstart", "-kp", f"gui/{os.getuid()}/{LABEL}"],
+                    capture_output=True, text=True
+                )
+            else:
+                send_telegram(f"CB Watchdog: 日志 {stale/60:.0f} 分钟无更新，进程未受 launchd 管理，需手动检查")
             sys.exit(1)
 
     print(f"CB OK: pid={pids[0]}")

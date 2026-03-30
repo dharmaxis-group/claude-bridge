@@ -28,7 +28,7 @@ from telegram.request import HTTPXRequest
 
 # ── 路径与常量 ──
 
-CB_HOME = Path.home() / ".claude-bridge"
+CB_HOME = Path(os.environ.get("CB_HOME", str(Path.home() / ".claude-bridge")))
 CONFIG_PATH = CB_HOME / "config.json"
 DB_PATH = CB_HOME / "data" / "sessions.db"
 LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
@@ -48,7 +48,7 @@ TZ_OFFSET = "+8 hours"  # UTC+8 for cost_log date queries
 DEFAULT_EFFORT = "high"
 VALID_EFFORTS = {"low", "medium", "high"}
 WAVE_FRAMES = ["◉ ◌ ◌", "◌ ◉ ◌", "◌ ◌ ◉", "◌ ◉ ◌"]
-WAVE_INTERVAL = 3.0  # seconds between wave animation frames (Telegram rate limit ~30 edits/min)
+WAVE_INTERVAL = 6.0  # seconds between wave animation frames (reduced from 3s to halve API pressure)
 
 # ── Agent Loop 常量 ──
 AGENT_PHASE_TIMEOUT = 600       # 10 min per phase
@@ -266,7 +266,7 @@ _cancelled: dict[str, bool] = {}  # chat_id -> cancel requested flag
 _context_buffer: dict[str, list[dict]] = {}  # "chat_id:project" -> [{user, assistant, ts}]
 CONTEXT_BUFFER_SIZE = 8  # keep last N exchanges for session continuity
 WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
-POLL_ACTIVITY_STALE_SEC = 120  # 2 min without actual getUpdates → force restart
+POLL_ACTIVITY_STALE_SEC = 300  # 5 min without actual getUpdates → force restart (was 120, raised to match WATCHDOG_STALE_SEC — proxy latency spikes were causing false restarts)
 
 # ── 敏感信息防护 ──
 
@@ -577,6 +577,11 @@ async def invoke_claude(message: str, project_path: str, session_id: str | None,
         log.error(f"JSON parse error: {e}, raw={raw[:200]}")
         return {"error": f"JSON parse error: {e}", "result": raw[:500]}
     except Exception as e:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
         log.error(f"invoke error: {e}")
         return {"error": str(e), "result": None}
 
@@ -722,6 +727,12 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
         if chat_id:
             _active_procs.pop(chat_id, None)
             _cancelled.pop(chat_id, None)
+        # Kill leaked subprocess to prevent zombie accumulation
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
         log.error(f"invoke_stream error: {e}")
         return {"error": str(e), "result": None}
 
@@ -941,8 +952,10 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             log.warning(f"Failed to delete sensitive message: {e}")
 
-    # P0: Inject Telegram behavior constraints
-    augmented_text = TELEGRAM_SYSTEM_CONTEXT + text
+    # P0: Inject Telegram behavior constraints (skip if systemContext disabled in config)
+    # Resumed sessions already have the rules in conversation history
+    _inject_ctx = load_config().get("injectSystemContext", True)
+    augmented_text = text  # default: no prefix for resumed sessions
 
     effective_model = None  # None = use active["model"]
     effective_effort = None
@@ -971,20 +984,23 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     session = get_session(chat_id_str, active["project"])
     session_id = session["session_id"] if session else None
 
-    # Context buffer: inject recent conversation history for new sessions
+    # New session: inject Telegram rules + context buffer (rules cached in conversation history for subsequent turns)
     if not session_id:
         ctx_key = f"{chat_id_str}:{active['project']}"
         recent = _context_buffer.get(ctx_key, [])
+        ctx_prefix = TELEGRAM_SYSTEM_CONTEXT if _inject_ctx else ""
         if recent:
             ctx_lines = []
             for entry in recent[-3:]:
                 ctx_lines.append(f"- User: {entry['user']}")
                 ctx_lines.append(f"  Assistant: {entry['assistant']}")
             augmented_text = (
-                TELEGRAM_SYSTEM_CONTEXT
+                ctx_prefix
                 + "[Previous conversation context:\n" + "\n".join(ctx_lines) + "]\n\n"
                 + text
             )
+        else:
+            augmented_text = ctx_prefix + text
 
     if session and (session["turns"] >= SESSION_ROTATE_TURNS or session["cost_usd"] >= SESSION_ROTATE_COST):
         kb = make_keyboard([("New session", "cmd:new"), ("Continue", "cmd:dismiss")], columns=2)
@@ -1242,7 +1258,10 @@ def _get_voice_settings() -> dict:
 
 
 def _get_elevenlabs_key() -> str:
-    """Read ElevenLabs API key from Keychain."""
+    """Read ElevenLabs API key from config (if present) or Keychain."""
+    _tts_cfg = load_config().get("tts", {}).get("elevenlabs", {})
+    if _tts_cfg.get("apiKey"):
+        return _tts_cfg["apiKey"]
     import subprocess as _sp
     return _sp.check_output(
         ["security", "find-generic-password", "-s", "elevenlabs-api-key", "-a", "elevenlabs", "-w"],
@@ -1274,13 +1293,15 @@ async def _tts_edge(clean: str, mp3_path, ogg_path, voice_name: str):
 async def _tts_elevenlabs(clean: str, mp3_path, ogg_path, voice_name: str):
     """Generate voice via ElevenLabs API."""
     import httpx
-    voice_id = ELEVENLABS_VOICES.get(voice_name, "EXAVITQu4vr4xnSDxMaL")
+    # Check for custom voice ID (e.g. FC Berty voice) before standard lookup
+    custom_id = get_setting("voice_custom_id", "")
+    voice_id = custom_id if custom_id else ELEVENLABS_VOICES.get(voice_name, "EXAVITQu4vr4xnSDxMaL")
     api_key = _get_elevenlabs_key()
     async with httpx.AsyncClient(proxy=get_proxy(), timeout=30) as client:
         resp = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
             headers={"xi-api-key": api_key, "Content-Type": "application/json"},
-            json={"text": clean, "model_id": ELEVENLABS_MODEL},
+            json={"text": clean, "model_id": load_config().get("tts", {}).get("elevenlabs", {}).get("modelId", ELEVENLABS_MODEL)},
         )
     if resp.status_code != 200:
         log.error(f"ElevenLabs API error: {resp.status_code} {resp.text[:200]}")
@@ -1449,6 +1470,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward unregistered /commands to Claude Code (gstack skills, etc.)."""
+    if not update.message or not update.message.text:
+        return
+    if not is_allowed(update.effective_chat.id):
+        return
+    text = update.message.text.strip()
+    # Telegram bot commands use _ but gstack skills use - (e.g. /office_hours → /office-hours)
+    if text.startswith("/"):
+        parts = text.split(None, 1)
+        cmd = parts[0].replace("_", "-")
+        text = cmd if len(parts) == 1 else f"{cmd} {parts[1]}"
+    log.info(f"handle_unknown_command: forwarding '{text[:50]}' to Claude Code")
+    await _invoke_and_reply(update, context, text)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info(f"handle_message: chat_id={update.effective_chat.id if update.effective_chat else 'None'}, "
              f"has_message={bool(update.message)}, has_text={bool(update.message and update.message.text)}")
@@ -1595,6 +1632,28 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active:
         await update.message.reply_text("No active project.")
         return
+    # Auto-review: consolidate memories before resetting session
+    cfg = load_config()
+    if cfg.get("autoReview", {}).get("enabled", False):
+        project_row = db.execute(
+            "SELECT path FROM projects WHERE name=?", (active["project"],)
+        ).fetchone()
+        if project_row and Path(project_row[0]).exists():
+            key = f"{chat_id_str}:{active['project']}"
+            entries = _context_buffer.get(key, [])
+            if entries and len(entries) >= 2:
+                await update.message.reply_text("📝 整理记忆中...")
+                result = await _auto_review_session(
+                    chat_id_str, active["project"], project_row[0]
+                )
+                if result:
+                    from datetime import datetime, timezone
+                    ts_key = f"auto_review_ts:{key}"
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (ts_key, datetime.now(timezone.utc).isoformat()),
+                    )
+                    db.commit()
     reset_session(chat_id_str, active["project"])
     await update.message.reply_text(f"New session: {active['project']}")
 
@@ -2818,6 +2877,136 @@ async def _cron_scheduler(bot):
         await asyncio.sleep(60)
 
 
+# ── Auto Review (Memory Consolidation) ──
+
+_AUTO_REVIEW_PROMPT = """自动记忆整理任务（系统定期执行，不需要回复用户）。
+
+以下是最近的对话摘要：
+{context}
+
+请检查这些对话内容，如果有值得长期记住的信息，例如：
+- 主人提到的偏好、习惯、计划
+- 重要的决定或待办事项
+- 主人的情绪状态或生活事件
+- 需要后续跟进的事情
+
+如果有值得记住的，请更新 memory/MEMORY.md（在「索引」部分之前添加条目）。
+如果没有需要记住的内容，回复"无需更新"即可。
+
+注意：只保存对未来对话有用的信息，不要保存闲聊内容。保持简洁。"""
+
+
+async def _auto_review_session(chat_id: str, project: str, project_path: str) -> dict | None:
+    """Run memory consolidation on recent context buffer entries."""
+    key = f"{chat_id}:{project}"
+    entries = _context_buffer.get(key, [])
+    if not entries or len(entries) < 2:
+        return None  # too few exchanges to review
+
+    lines = []
+    for e in entries:
+        ts = e.get("ts", "")
+        lines.append(f"[{ts}] 用户: {e.get('user', '')}")
+        lines.append(f"  助手: {e.get('assistant', '')}")
+
+    prompt = _AUTO_REVIEW_PROMPT.format(context="\n".join(lines))
+
+    try:
+        result = await invoke_claude(
+            message=prompt,
+            project_path=project_path,
+            session_id=None,
+            model="sonnet",
+            tool_profile="default",
+            effort="low",
+            bypass_permissions=True,
+        )
+        cost = result.get("total_cost_usd", 0.0)
+        log.info(f"auto-review completed for {project}: cost=${cost:.4f}")
+        return result
+    except Exception as e:
+        log.error(f"auto-review failed for {project}: {e}")
+        return None
+
+
+async def _auto_review_loop(bot):
+    """Background task: periodically consolidate memories for instances with autoReview enabled."""
+    await asyncio.sleep(120)  # wait 2 min after startup
+    while True:
+        try:
+            cfg = load_config()
+            ar_cfg = cfg.get("autoReview", {})
+            if not ar_cfg.get("enabled", False):
+                await asyncio.sleep(3600)
+                continue
+
+            interval = ar_cfg.get("intervalHours", 6) * 3600
+
+            for key, entries in list(_context_buffer.items()):
+                if len(entries) < 2:
+                    continue
+                parts = key.split(":", 1)
+                if len(parts) != 2:
+                    continue
+                chat_id, project = parts
+
+                # Check last auto-review time
+                ts_key = f"auto_review_ts:{key}"
+                last = db.execute(
+                    "SELECT value FROM settings WHERE key=?", (ts_key,)
+                ).fetchone()
+
+                if last:
+                    from datetime import datetime, timezone
+                    try:
+                        last_dt = datetime.fromisoformat(last[0])
+                        now = datetime.now(timezone.utc)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        if (now - last_dt).total_seconds() < interval:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                project_row = db.execute(
+                    "SELECT path FROM projects WHERE name=?", (project,)
+                ).fetchone()
+                if not project_row or not Path(project_row[0]).exists():
+                    continue
+
+                log.info(f"auto-review starting for {project} (periodic)")
+                result = await _auto_review_session(chat_id, project, project_row[0])
+
+                if result:
+                    # Update last review timestamp
+                    from datetime import datetime, timezone
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    db.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (ts_key, now_iso),
+                    )
+                    db.commit()
+
+                    # Optionally notify user
+                    if ar_cfg.get("notify", False):
+                        text = result.get("result", "") or ""
+                        if text and "无需更新" not in text:
+                            cost = result.get("total_cost_usd", 0.0)
+                            try:
+                                await bot.send_message(
+                                    chat_id=int(chat_id),
+                                    text=f"🐾 记忆整理完成\n\n{text[:500]}\n\n`auto-review | ${cost:.4f}`",
+                                    parse_mode="Markdown",
+                                )
+                            except Exception as e:
+                                log.error(f"auto-review notify failed: {e}")
+
+        except Exception as e:
+            log.error(f"auto-review loop error: {e}", exc_info=True)
+
+        await asyncio.sleep(3600)  # check every hour
+
+
 # ── Error Handler ──
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -2865,6 +3054,16 @@ async def post_init(app: Application):
         BotCommand("cleanup", "Organize desktop"),
         BotCommand("restart", "Restart CB service"),
         BotCommand("help", "Help"),
+        # ── gstack 技能（转发给 Claude Code）──
+        BotCommand("office_hours", "gstack: YC 需求澄清"),
+        BotCommand("plan_ceo_review", "gstack: CEO 产品评审"),
+        BotCommand("plan_eng_review", "gstack: 架构评审"),
+        BotCommand("review", "gstack: 代码审查"),
+        BotCommand("ship", "gstack: 发 PR"),
+        BotCommand("qa", "gstack: QA 测试"),
+        BotCommand("retro", "gstack: 周回顾"),
+        BotCommand("investigate", "gstack: 根因调查"),
+        BotCommand("cso", "gstack: 安全审计"),
     ])
     # Start cron scheduler background task
     _create_background_task(_cron_scheduler(app.bot), name="cron-scheduler")
@@ -2872,6 +3071,30 @@ async def post_init(app: Application):
     _create_background_task(_heartbeat_loop(), name="uptime-kuma-heartbeat")
     # Start poll health monitor
     _create_background_task(_poll_monitor(), name="poll-monitor")
+    # Start auto-review loop (memory consolidation, controlled by config.autoReview)
+    _create_background_task(_auto_review_loop(app.bot), name="auto-review")
+    # Auto-configure TTS from config.json if present
+    _cfg = load_config()
+    tts_cfg = _cfg.get("tts", {})
+    if tts_cfg.get("provider") == "elevenlabs" and tts_cfg.get("auto") == "inbound":
+        el_cfg = tts_cfg.get("elevenlabs", {})
+        if el_cfg.get("voiceId"):
+            set_setting("voice_enabled", "1")
+            set_setting("voice_engine", "eleven")
+            # Store custom voice ID for direct lookup
+            set_setting("voice_custom_id", el_cfg["voiceId"])
+            log.info(f"TTS auto-configured: ElevenLabs, voiceId={el_cfg['voiceId']}")
+    # Auto-register default project from config.json if present
+    default_proj = _cfg.get("defaultProject")
+    if default_proj and default_proj.get("name") and default_proj.get("path"):
+        existing = [p["name"] for p in list_projects()]
+        if default_proj["name"] not in existing:
+            db.execute(
+                "INSERT OR REPLACE INTO projects (name, path, description) VALUES (?, ?, ?)",
+                (default_proj["name"], default_proj["path"], default_proj.get("description", "")),
+            )
+            db.commit()
+            log.info(f"Auto-registered default project: {default_proj['name']} → {default_proj['path']}")
     log.info("Claude Bridge started")
 
 
@@ -2898,10 +3121,10 @@ def main():
     app = (
         Application.builder()
         .token(token)
-        .request(HTTPXRequest(connection_pool_size=16, pool_timeout=30.0,
+        .request(HTTPXRequest(connection_pool_size=32, pool_timeout=60.0,
                              connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
                              proxy=proxy))
-        .get_updates_request(HTTPXRequest(connection_pool_size=4, pool_timeout=10.0,
+        .get_updates_request(HTTPXRequest(connection_pool_size=8, pool_timeout=15.0,
                                           connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
                                           proxy=proxy))
         .post_init(post_init)
@@ -2937,6 +3160,8 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # ── 万能兜底：未注册的 /command 转发给 Claude Code（gstack 等技能）──
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
 
     _start_watchdog_thread()
 
@@ -2960,4 +3185,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        # python-telegram-bot shutdown race: event loop destroyed while
+        # bootstrap_retries sleep is pending. Safe to exit cleanly —
+        # launchd KeepAlive will restart the process.
+        import sys
+        sys.stderr.write(f"[CB] clean exit on RuntimeError during shutdown: {e}\n")
+        sys.stderr.flush()
+        sys.exit(0)
