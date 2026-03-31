@@ -16,6 +16,8 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,7 +39,9 @@ VOICE_DIR = CB_HOME / "data" / "voice"
 
 DEFAULT_MODEL = "opus"
 MAX_TURNS = 50  # enough for complex tasks like sync/review
-MAX_CONCURRENT_WORKERS = 4
+MAX_CONCURRENT_WORKERS = 3   # matches Claude Max real concurrency (~2-3 simultaneous claude -p)
+MAX_CONCURRENT_PER_USER = 3
+MAX_TOTAL_TASKS = 20
 TELEGRAM_MAX_LEN = 4000
 SESSION_ROTATE_TURNS = 50
 SESSION_ROTATE_COST = 2.0
@@ -249,11 +253,127 @@ def set_setting(key: str, value: str):
     db.commit()
 
 
+# ── Task 并发管理 ──
+
+TASK_PRIORITY_QUICK = 0    # queries, status checks — scheduled first
+TASK_PRIORITY_NORMAL = 1   # regular conversation
+TASK_PRIORITY_HEAVY = 2    # agent loop, long tasks
+
+
+@dataclass
+class Task:
+    task_id: str
+    chat_id: str
+    message_id: int          # 原始消息 ID，用于 reply_to
+    label: str               # 消息前 15 字做标签
+    status: str = "queued"   # queued → running → done/failed/cancelled
+    priority: int = TASK_PRIORITY_NORMAL
+    proc: asyncio.subprocess.Process | None = None
+    created_at: float = field(default_factory=time.time)
+    tool_count: int = 0      # tools used so far (for progress display)
+    started_at: float = 0.0  # when status changed to running
+
+
+class TaskManager:
+    def __init__(self, max_per_user: int, max_total: int):
+        self._tasks: dict[str, Task] = {}           # task_id → Task
+        self._user_tasks: dict[str, list[str]] = {}  # chat_id → [task_ids]
+        self._max_per_user = max_per_user
+        self._max_total = max_total
+        self._effective_workers = MAX_CONCURRENT_WORKERS  # adaptive: lowered on 503
+        self._consecutive_503 = 0
+
+    def can_submit(self, chat_id: str) -> tuple[bool, str]:
+        active = [tid for tid in self._user_tasks.get(chat_id, [])
+                  if self._tasks.get(tid) and self._tasks[tid].status in ("queued", "running")]
+        if len(active) >= self._max_per_user:
+            return False, f"Concurrent limit ({self._max_per_user}). /tasks to check."
+        total_active = sum(1 for t in self._tasks.values() if t.status in ("queued", "running"))
+        if total_active >= self._max_total:
+            return False, "System busy. Try again later."
+        return True, ""
+
+    def submit(self, chat_id: str, message_id: int, label: str,
+               priority: int = TASK_PRIORITY_NORMAL) -> Task:
+        task_id = uuid.uuid4().hex[:8]
+        task = Task(task_id=task_id, chat_id=chat_id, message_id=message_id,
+                    label=label, priority=priority)
+        self._tasks[task_id] = task
+        self._user_tasks.setdefault(chat_id, []).append(task_id)
+        return task
+
+    def set_running(self, task_id: str, proc: asyncio.subprocess.Process):
+        task = self._tasks.get(task_id)
+        if task:
+            task.status = "running"
+            task.proc = proc
+            task.started_at = time.time()
+
+    def complete(self, task_id: str):
+        self._remove(task_id, "done")
+        # Successful completion: recover from 503 throttle
+        if self._consecutive_503 > 0:
+            self._consecutive_503 = max(0, self._consecutive_503 - 1)
+            if self._consecutive_503 == 0:
+                self._effective_workers = MAX_CONCURRENT_WORKERS
+                log.info(f"TaskManager: recovered from throttle, workers={self._effective_workers}")
+
+    def fail(self, task_id: str):
+        self._remove(task_id, "failed")
+
+    def cancel(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        if not task or task.status not in ("queued", "running"):
+            return False
+        if task.proc:
+            try:
+                task.proc.kill()
+            except ProcessLookupError:
+                pass
+        self._remove(task_id, "cancelled")
+        return True
+
+    def report_throttle(self):
+        """Called when Claude returns 503/overloaded. Reduces effective workers."""
+        self._consecutive_503 += 1
+        new_limit = max(1, self._effective_workers - 1)
+        if new_limit != self._effective_workers:
+            self._effective_workers = new_limit
+            log.warning(f"TaskManager: Claude throttle detected, workers reduced to {self._effective_workers}")
+
+    def has_running(self, chat_id: str) -> bool:
+        return len(self.get_user_active(chat_id)) > 0
+
+    def running_count(self) -> int:
+        return sum(1 for t in self._tasks.values() if t.status == "running")
+
+    def queued_count(self) -> int:
+        return sum(1 for t in self._tasks.values() if t.status == "queued")
+
+    def get_user_active(self, chat_id: str) -> list[Task]:
+        return [self._tasks[tid] for tid in self._user_tasks.get(chat_id, [])
+                if tid in self._tasks and self._tasks[tid].status in ("queued", "running")]
+
+    def get_task(self, task_id: str) -> Task | None:
+        return self._tasks.get(task_id)
+
+    def _remove(self, task_id: str, final_status: str):
+        task = self._tasks.pop(task_id, None)
+        if task:
+            task.status = final_status
+            task.proc = None
+            user_list = self._user_tasks.get(task.chat_id, [])
+            if task_id in user_list:
+                user_list.remove(task_id)
+            if not user_list:
+                self._user_tasks.pop(task.chat_id, None)
+
+
 # ── 全局状态 ──
 
 db: sqlite3.Connection = None
-user_locks: dict[str, asyncio.Lock] = {}
 worker_semaphore: asyncio.Semaphore = None
+task_manager: TaskManager = None  # initialized in main()
 agent_running: dict[str, dict] = {}   # chat_id -> {"cancel": Event, ...}
 _sensitive_values: dict[str, list[str]] = {}  # chat_id -> [password_value, ...]
 _background_tasks: set[asyncio.Task] = set()  # prevent GC of fire-and-forget tasks
@@ -261,8 +381,10 @@ _watchdog_ts: float = time.time()  # updated by heartbeat; checked by OS thread 
 _poll_ts: float = time.time()  # updated by poll monitor; checked by OS thread watchdog
 _last_getupdate_ts: float = 0.0  # 0 = never seen; set by first getUpdates 200 OK
 _app_ref = None  # set in main(), used by poll monitor
-_active_procs: dict[str, asyncio.subprocess.Process] = {}  # chat_id -> running subprocess (for /cancel)
-_cancelled: dict[str, bool] = {}  # chat_id -> cancel requested flag
+_active_procs: dict[str, asyncio.subprocess.Process] = {}  # chat_id -> proc (agent system only)
+_cancelled: dict[str, bool] = {}  # task_id or chat_id -> cancel flag
+_typing_chats: dict[int, int] = {}  # chat_id -> active_task_count (shared typing loop)
+_typing_loop_task: asyncio.Task | None = None  # single global typing loop
 _context_buffer: dict[str, list[dict]] = {}  # "chat_id:project" -> [{user, assistant, ts}]
 CONTEXT_BUFFER_SIZE = 8  # keep last N exchanges for session continuity
 WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
@@ -313,10 +435,7 @@ def _sanitize_response(chat_id: str, text: str) -> str:
     return text
 
 
-def get_user_lock(chat_id: str) -> asyncio.Lock:
-    if chat_id not in user_locks:
-        user_locks[chat_id] = asyncio.Lock()
-    return user_locks[chat_id]
+# get_user_lock removed — replaced by TaskManager per-user concurrency cap
 
 
 def _create_background_task(coro, *, name: str = None) -> asyncio.Task:
@@ -614,7 +733,8 @@ def _format_tool_progress(name: str, input_data: dict) -> str:
 async def invoke_claude_streaming(message: str, project_path: str, session_id: str | None,
                                    model: str, tool_profile: str, effort: str = "medium",
                                    bypass_permissions: bool = False,
-                                   on_tool_use=None, chat_id: str = None) -> dict:
+                                   on_tool_use=None, chat_id: str = None,
+                                   task_id: str = None) -> dict:
     """Stream claude -p output via stream-json, calling on_tool_use(name, input) for progress.
     Returns the final result dict (same schema as invoke_claude)."""
     claude_bin = get_claude_bin()
@@ -641,7 +761,9 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
             cwd=project_path,
             env=CLAUDE_ENV,
         )
-        if chat_id:
+        if task_id and task_manager:
+            task_manager.set_running(task_id, proc)
+        elif chat_id:
             _active_procs[chat_id] = proc
         proc.stdin.write(message.encode("utf-8"))
         await proc.stdin.drain()
@@ -708,11 +830,16 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
                             await on_tool_use(block.get("name", ""), block.get("input", {}))
 
         await proc.wait()
-        if chat_id:
+        cancel_key = task_id or chat_id
+        if task_id and task_manager:
+            t = task_manager.get_task(task_id)
+            if t:
+                t.proc = None  # proc ended; TaskManager.complete() will remove it
+        elif chat_id:
             _active_procs.pop(chat_id, None)
 
         # Check if cancelled by user — always honour cancel regardless of partial result
-        if chat_id and _cancelled.pop(chat_id, False):
+        if cancel_key and _cancelled.pop(cancel_key, False):
             return {"error": "Cancelled by user", "result": None}
 
         if proc.returncode != 0 and not result.get("result"):
@@ -724,9 +851,15 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
         return result
 
     except Exception as e:
-        if chat_id:
+        cancel_key = task_id or chat_id
+        if task_id and task_manager:
+            t = task_manager.get_task(task_id)
+            if t:
+                t.proc = None
+        elif chat_id:
             _active_procs.pop(chat_id, None)
-            _cancelled.pop(chat_id, None)
+        if cancel_key:
+            _cancelled.pop(cancel_key, None)
         # Kill leaked subprocess to prevent zombie accumulation
         try:
             proc.kill()
@@ -739,16 +872,44 @@ async def invoke_claude_streaming(message: str, project_path: str, session_id: s
 
 # ── Telegram 消息处理 ──
 
+async def _shared_typing_loop(bot):
+    """Single global typing loop for all active chats. Reduces Telegram API pressure
+    from N concurrent send_chat_action calls to 1 per chat every 5s."""
+    while True:
+        chats = dict(_typing_chats)  # snapshot
+        for chat_id, count in chats.items():
+            if count > 0:
+                try:
+                    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+        await asyncio.sleep(5.0)
+
+
+def _typing_register(chat_id: int, bot):
+    """Register a chat as needing typing indicator. Starts global loop if needed."""
+    global _typing_loop_task
+    _typing_chats[chat_id] = _typing_chats.get(chat_id, 0) + 1
+    if _typing_loop_task is None or _typing_loop_task.done():
+        _typing_loop_task = _create_background_task(_shared_typing_loop(bot), name="shared-typing")
+
+
+def _typing_unregister(chat_id: int):
+    """Unregister a chat from typing indicator."""
+    count = _typing_chats.get(chat_id, 0)
+    if count <= 1:
+        _typing_chats.pop(chat_id, None)
+    else:
+        _typing_chats[chat_id] = count - 1
+
+
 async def send_typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event):
-    while not stop_event.is_set():
-        try:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except Exception:
-            pass
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
-        except asyncio.TimeoutError:
-            pass
+    """Legacy per-task typing — now delegates to shared loop."""
+    _typing_register(chat_id, context.bot)
+    try:
+        await stop_event.wait()
+    finally:
+        _typing_unregister(chat_id)
 
 
 async def send_long_message(bot, chat_id: int, text: str):
@@ -1009,50 +1170,87 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=kb,
         )
 
-    # P0: Feedback guarantee — notify user if blocked by lock or semaphore
-    lock = get_user_lock(chat_id_str)
-    if lock.locked():
-        try:
-            await update.message.reply_text("Previous request still running, queued...")
-        except Exception:
-            pass
-        log.info(f"user {chat_id_str} queued behind per-user lock")
+    # ── Multi-agent concurrency: per-user cap check ──
+    can, reject_reason = task_manager.can_submit(chat_id_str)
+    if not can:
+        await update.message.reply_text(reject_reason)
+        return
 
-    # Progress message with wave animation (retry on network timeout)
+    # Determine session strategy:
+    # If user already has running tasks → independent session (task mode)
+    # If no concurrent tasks → resume session (conversation mode)
+    has_concurrent = task_manager.has_running(chat_id_str)
+    if has_concurrent:
+        session_id = None  # Force new session — avoid --resume conflict
+        augmented_text = (TELEGRAM_SYSTEM_CONTEXT if _inject_ctx else "") + text
+
+    # Auto-detect task priority from content
+    _quick_patterns = re.compile(
+        r'^(/status|/cost|/health|/tasks|查|看|是什么|多少|几个|什么时候|状态|帮我查)',
+        re.IGNORECASE)
+    task_priority = TASK_PRIORITY_QUICK if _quick_patterns.search(text) else TASK_PRIORITY_NORMAL
+
+    # Register task
+    task_label = text[:15].replace("\n", " ").strip()
+    task = task_manager.submit(chat_id_str, update.message.message_id, task_label,
+                               priority=task_priority)
+
+    # Show queue status when multiple tasks are active
+    running_n = task_manager.running_count()
+    queued_n = task_manager.queued_count()
+    if has_concurrent and queued_n > 0:
+        queue_hint = f" (#{running_n + queued_n} in queue)"
+    else:
+        queue_hint = ""
+
+    # Progress message: reply_to original message for multi-task traceability
+    progress_prefix = f"「{task_label}」" if has_concurrent else ""
     progress_msg = None
+    reply_kwargs = {}
+    if has_concurrent:
+        reply_kwargs["reply_to_message_id"] = update.message.message_id
     for _retry in range(3):
         try:
-            progress_msg = await update.message.reply_text(WAVE_FRAMES[0])
+            progress_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{progress_prefix}{WAVE_FRAMES[0]}{queue_hint}",
+                **reply_kwargs)
             break
         except Exception as e:
             if _retry < 2:
                 log.warning(f"reply_text retry {_retry+1}/3: {e}")
                 await asyncio.sleep(2.0)
             else:
+                task_manager.fail(task.task_id)
                 raise
     progress_lines = []
     stop_wave = asyncio.Event()
 
     async def _wave_animation():
-        """Animate wave dots + tool progress on the progress message."""
+        """Animate wave dots + tool progress. Degrades to static when ≥2 concurrent tasks
+        to halve Telegram API pressure (only first task gets animation)."""
+        is_primary = (running_n == 0)  # first task gets full animation
         frame_idx = 0
         backoff = WAVE_INTERVAL
         while not stop_wave.is_set():
             frame_idx += 1
-            wave = WAVE_FRAMES[frame_idx % len(WAVE_FRAMES)]
-            if progress_lines:
-                display = progress_lines[-6:]
-                text = wave + "\n" + "\n".join(f"`> {l}`" for l in display)
-            else:
-                text = wave
-            try:
-                await progress_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-                backoff = WAVE_INTERVAL  # reset on success
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "Too Many Requests" in err_str or "Flood" in err_str:
-                    backoff = min(backoff * 2, 30.0)  # exponential backoff, max 30s
-                # else: transient error, keep current interval
+            if is_primary or frame_idx % 3 == 0:
+                # Primary task: animate every frame. Secondary: every 3rd frame (18s)
+                wave = WAVE_FRAMES[frame_idx % len(WAVE_FRAMES)]
+                if progress_lines:
+                    display = progress_lines[-6:]
+                    anim_text = f"{progress_prefix}{wave}\n" + "\n".join(f"`> {l}`" for l in display)
+                else:
+                    tools_n = task.tool_count
+                    anim_text = f"{progress_prefix}{wave}" + (f" ({tools_n} tools)" if tools_n else "")
+                try:
+                    await progress_msg.edit_text(anim_text, parse_mode=ParseMode.MARKDOWN)
+                    backoff = WAVE_INTERVAL
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "Too Many Requests" in err_str or "Flood" in err_str:
+                        backoff = min(backoff * 2, 30.0)
+                    # else: transient error, silently skip (non-critical path)
             try:
                 await asyncio.wait_for(stop_wave.wait(), timeout=backoff)
                 break
@@ -1062,50 +1260,59 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     output_files = []
 
     async def on_tool_use(tool_name: str, tool_input: dict):
+        task.tool_count += 1
         progress_lines.append(_format_tool_progress(tool_name, tool_input))
         if tool_name == "Write" and tool_input.get("file_path"):
             output_files.append(tool_input["file_path"])
 
-    async with lock:
-        # P1: Notify if all workers busy
-        if worker_semaphore._value == 0:
-            try:
-                await progress_msg.edit_text("System busy, waiting for a slot...")
-            except Exception:
-                pass
-            log.info(f"user {chat_id_str} queued behind worker semaphore ({MAX_CONCURRENT_WORKERS} workers full)")
-        async with worker_semaphore:
-            stop_typing = asyncio.Event()
-            typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
-            wave_task = asyncio.create_task(_wave_animation())
-            try:
-                use_model = effective_model or active["model"]
-                use_effort = effective_effort or active["effort"]
-                result = await invoke_claude_streaming(
-                    message=augmented_text,
-                    project_path=active["path"],
-                    session_id=session_id,
-                    model=use_model,
-                    tool_profile=active["tool_profile"],
-                    effort=use_effort,
-                    on_tool_use=on_tool_use,
-                    chat_id=chat_id_str,
-                )
-            finally:
-                stop_typing.set()
-                stop_wave.set()
-                await typing_task
-                await wave_task
+    # Concurrency controlled by TaskManager cap + global semaphore
+    if worker_semaphore._value == 0:
+        try:
+            await progress_msg.edit_text(f"{progress_prefix}System busy, waiting for a slot...")
+        except Exception:
+            pass
+        log.info(f"user {chat_id_str} task {task.task_id} queued (priority={task_priority}, "
+                 f"workers={task_manager._effective_workers})")
+    async with worker_semaphore:
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
+        wave_task = asyncio.create_task(_wave_animation())
+        try:
+            use_model = effective_model or active["model"]
+            use_effort = effective_effort or active["effort"]
+            result = await invoke_claude_streaming(
+                message=augmented_text,
+                project_path=active["path"],
+                session_id=session_id,
+                model=use_model,
+                tool_profile=active["tool_profile"],
+                effort=use_effort,
+                on_tool_use=on_tool_use,
+                chat_id=chat_id_str,
+                task_id=task.task_id,
+            )
+        finally:
+            stop_typing.set()
+            stop_wave.set()
+            await typing_task
+            await wave_task
 
     result = _safe_result(result)
-    if result.get("error") and not result.get("result"):
+
+    # ── 503/overloaded detection: adaptive throttle ──
+    err_text = result.get("error", "")
+    if err_text and ("503" in err_text or "overloaded" in err_text.lower()):
+        task_manager.report_throttle()
+
+    if err_text and not result.get("result"):
+        task_manager.fail(task.task_id)
         try:
             await progress_msg.delete()
         except Exception:
             pass
         for _r in range(3):
             try:
-                await update.message.reply_text(f"Error: {result['error'][:500]}")
+                await update.message.reply_text(f"Error: {err_text[:500]}")
                 break
             except Exception:
                 if _r < 2:
@@ -1129,9 +1336,12 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Sanitize sensitive data before sending to Telegram
     reply_text = _sanitize_response(chat_id_str, reply_text)
 
-    cost_tag = f"\n\n`{active['project']} | {use_model} | {use_effort} | ${cost:.4f} | {duration/1000:.1f}s`"
+    # Cost tag with tool count for multi-task awareness
+    tools_tag = f" | {task.tool_count}t" if task.tool_count else ""
+    cost_tag = f"\n\n`{active['project']} | {use_model} | {use_effort} | ${cost:.4f} | {duration/1000:.1f}s{tools_tag}`"
     full_reply = reply_text + cost_tag
 
+    task_manager.complete(task.task_id)
     upsert_session(chat_id_str, active["project"], new_session_id, active["model"], turns, cost)
     log_cost(chat_id_str, active["project"], cost, turns, duration)
 
@@ -1191,6 +1401,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt += f"\n\nUser message: {caption}"
         else:
             prompt += "\n\nDescribe what you see and ask if I need help with anything."
+
+        # Prepend quoted message context if replying to a previous message
+        if update.message.reply_to_message:
+            quoted = update.message.reply_to_message
+            quoted_text = quoted.text or quoted.caption or ""
+            if quoted_text:
+                quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+                prompt = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{prompt}"
 
         await _invoke_and_reply(update, context, prompt)
 
@@ -1500,6 +1718,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         log.info("handle_message: empty text after strip")
         return
+
+    # Extract quoted message when user replies to a previous message
+    if update.message.reply_to_message:
+        quoted = update.message.reply_to_message
+        quoted_text = quoted.text or quoted.caption or ""
+        if quoted_text:
+            quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+            text = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{text}"
+            log.info(f"handle_message: reply context prepended ({len(quoted_text)} chars from {quoted_author})")
+
     log.info(f"handle_message: processing text='{text[:50]}...' from {update.effective_chat.id}")
 
     # Intercept budget amount input
@@ -2051,25 +2279,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("No active project.")
             return
         await query.edit_message_text("Executing...")
-        lock = get_user_lock(chat_id_str)
-        async with lock:
-            async with worker_semaphore:
-                stop_typing = asyncio.Event()
-                typing_task = asyncio.create_task(
-                    send_typing_loop(context, chat_id, stop_typing))
-                try:
-                    result = await invoke_claude(
-                        message="User confirmed. Execute the operations described above.",
-                        project_path=active["path"],
-                        session_id=target_session,
-                        model=active["model"],
-                        tool_profile="standard",
-                        effort=active["effort"],
-                        bypass_permissions=True,
-                    )
-                finally:
-                    stop_typing.set()
-                    await typing_task
+        async with worker_semaphore:
+            stop_typing = asyncio.Event()
+            typing_task = asyncio.create_task(
+                send_typing_loop(context, chat_id, stop_typing))
+            try:
+                result = await invoke_claude(
+                    message="User confirmed. Execute the operations described above.",
+                    project_path=active["path"],
+                    session_id=target_session,
+                    model=active["model"],
+                    tool_profile="standard",
+                    effort=active["effort"],
+                    bypass_permissions=True,
+                )
+            finally:
+                stop_typing.set()
+                await typing_task
         result = _safe_result(result)
         if result.get("error") and not result.get("result"):
             await context.bot.send_message(
@@ -2087,6 +2313,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "task_cancel":
         await query.edit_message_text("Task cancelled.")
+
+    # ── cancel_task:<task_id> or cancel_task:all ──
+    elif data.startswith("cancel_task:"):
+        target = data.split(":", 1)[1]
+        if target == "all":
+            active_tasks = task_manager.get_user_active(chat_id_str)
+            for t in active_tasks:
+                _cancelled[t.task_id] = True
+                task_manager.cancel(t.task_id)
+            await query.edit_message_text(f"Cancelled {len(active_tasks)} tasks.")
+        else:
+            t = task_manager.get_task(target)
+            if t:
+                _cancelled[t.task_id] = True
+                task_manager.cancel(t.task_id)
+                await query.edit_message_text(f"Cancelled「{t.label}」")
+            else:
+                await query.edit_message_text("Task not found or already finished.")
 
     # ── budget:<action> ──
     elif data.startswith("budget:"):
@@ -2139,23 +2383,21 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_id = session["session_id"] if session else None
 
     # Phase 1: readonly analysis
-    lock = get_user_lock(chat_id_str)
-    async with lock:
-        async with worker_semaphore:
-            stop_typing = asyncio.Event()
-            typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
-            try:
-                result = await invoke_claude(
-                    message=task_text,
-                    project_path=active["path"],
-                    session_id=session_id,
-                    model=active["model"],
-                    tool_profile="readonly",
-                    effort=active["effort"],
-                )
-            finally:
-                stop_typing.set()
-                await typing_task
+    async with worker_semaphore:
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(send_typing_loop(context, chat_id, stop_typing))
+        try:
+            result = await invoke_claude(
+                message=task_text,
+                project_path=active["path"],
+                session_id=session_id,
+                model=active["model"],
+                tool_profile="readonly",
+                effort=active["effort"],
+            )
+        finally:
+            stop_typing.set()
+            await typing_task
 
     result = _safe_result(result)
     if result.get("error") and not result.get("result"):
@@ -2635,6 +2877,44 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os._exit(0)
 
 
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tasks — list active tasks with progress details"""
+    if not is_allowed(update.effective_chat.id):
+        return
+    chat_id_str = str(update.effective_chat.id)
+    active_tasks = task_manager.get_user_active(chat_id_str)
+
+    # Also check agent system
+    agent = agent_running.get(chat_id_str)
+
+    if not active_tasks and not agent:
+        await update.message.reply_text("No active tasks.")
+        return
+
+    # System status header
+    running = task_manager.running_count()
+    eff_w = task_manager._effective_workers
+    header = f"Workers: {running}/{eff_w}"
+    if eff_w < MAX_CONCURRENT_WORKERS:
+        header += " (throttled)"
+
+    lines = [header, ""]
+    prio_labels = {TASK_PRIORITY_QUICK: "Q", TASK_PRIORITY_NORMAL: "N", TASK_PRIORITY_HEAVY: "H"}
+    for i, t in enumerate(active_tasks, 1):
+        if t.status == "running" and t.started_at:
+            elapsed = int(time.time() - t.started_at)
+        else:
+            elapsed = int(time.time() - t.created_at)
+        status_icon = "🟢" if t.status == "running" else "🟡"
+        prio = prio_labels.get(t.priority, "?")
+        tools = f" {t.tool_count}tools" if t.tool_count else ""
+        lines.append(f"{i}. {status_icon} [{prio}]「{t.label}」{t.status} {elapsed}s{tools}")
+    if agent:
+        ag_elapsed = int(time.time() - agent.get("started", time.time()))
+        lines.append(f"{len(active_tasks)+1}. 🔵 Agent {ag_elapsed}s: {agent.get('objective', '')[:30]}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel — cancel running Claude operation or agent"""
     if not is_allowed(update.effective_chat.id):
@@ -2646,19 +2926,35 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if running:
         running["cancel"].set()
 
-    # Kill active subprocess
-    proc = _active_procs.get(chat_id_str)
-    if proc:
-        _cancelled[chat_id_str] = True
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await update.message.reply_text("Cancelling...")
+    # Check TaskManager for active tasks
+    active_tasks = task_manager.get_user_active(chat_id_str)
+
+    if len(active_tasks) == 1:
+        # Single task — cancel directly
+        t = active_tasks[0]
+        _cancelled[t.task_id] = True
+        task_manager.cancel(t.task_id)
+        await update.message.reply_text(f"Cancelling「{t.label}」...")
+    elif len(active_tasks) > 1:
+        # Multiple tasks — show inline keyboard to pick
+        buttons = [(f"「{t.label}」", f"cancel_task:{t.task_id}") for t in active_tasks]
+        buttons.append(("Cancel all", "cancel_task:all"))
+        kb = make_keyboard(buttons, columns=1)
+        await update.message.reply_text("Which task to cancel?", reply_markup=kb)
     elif running:
         await update.message.reply_text("Stopping agent...")
     else:
-        await update.message.reply_text("Nothing running.")
+        # Fallback: check legacy _active_procs (for agent_invoke)
+        proc = _active_procs.get(chat_id_str)
+        if proc:
+            _cancelled[chat_id_str] = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await update.message.reply_text("Cancelling...")
+        else:
+            await update.message.reply_text("Nothing running.")
 
 
 # ── /cron 定时任务 ──
@@ -2848,14 +3144,15 @@ async def _cron_scheduler(bot):
                 db.commit()
 
                 log.info(f"cron #{job_id} running: {prompt[:50]}")
-                result = _safe_result(await invoke_claude(
-                    message=prompt,
-                    project_path=project_row[0],
-                    session_id=None,
-                    model=model,
-                    tool_profile="readonly",
-                    effort=effort,
-                ))
+                async with worker_semaphore:
+                    result = _safe_result(await invoke_claude(
+                        message=prompt,
+                        project_path=project_row[0],
+                        session_id=None,
+                        model=model,
+                        tool_profile="readonly",
+                        effort=effort,
+                    ))
 
                 reply = result.get("result", "") or result.get("error", "No output")
                 cost = result.get("total_cost_usd", 0.0)
@@ -3036,6 +3333,7 @@ async def post_init(app: Application):
         BotCommand("status", "Status & settings"),
         BotCommand("model", "Select model"),
         BotCommand("task", "Readonly analyze, then execute"),
+        BotCommand("tasks", "Active tasks & queue"),
         # ── 中频：调优 ──
         BotCommand("think", "Opus + deep thinking"),
         BotCommand("effort", "Thinking depth"),
@@ -3099,7 +3397,7 @@ async def post_init(app: Application):
 
 
 def main():
-    global db, worker_semaphore, _app_ref
+    global db, worker_semaphore, task_manager, _app_ref
 
     if not CONFIG_PATH.exists():
         print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
@@ -3117,14 +3415,16 @@ def main():
     db = init_db()
     _load_context_buffers()
     worker_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    task_manager = TaskManager(MAX_CONCURRENT_PER_USER, MAX_TOTAL_TASKS)
 
     app = (
         Application.builder()
         .token(token)
-        .request(HTTPXRequest(connection_pool_size=32, pool_timeout=60.0,
+        .concurrent_updates(MAX_TOTAL_TASKS)  # P0: enable concurrent handler dispatch
+        .request(HTTPXRequest(connection_pool_size=48, pool_timeout=90.0,
                              connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
                              proxy=proxy))
-        .get_updates_request(HTTPXRequest(connection_pool_size=8, pool_timeout=15.0,
+        .get_updates_request(HTTPXRequest(connection_pool_size=8, pool_timeout=30.0,
                                           connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
                                           proxy=proxy))
         .post_init(post_init)
@@ -3148,6 +3448,7 @@ def main():
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("agent", cmd_agent))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("cron", cmd_cron))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("sleep", cmd_sleep))

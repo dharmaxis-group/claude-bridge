@@ -5,10 +5,22 @@ All notable changes to Claude Bridge are documented here.
 ## [Unreleased]
 
 ### Added
+- **Multi-agent parallel processing** — `concurrent_updates` enabled, 3 concurrent workers per user. Send multiple messages simultaneously and they process in parallel
+- **Task priority system** — auto-detects quick queries vs normal conversations vs heavy agent tasks. Quick tasks get priority scheduling
+- **503 adaptive throttle** — Claude Max rate limiting auto-detected, workers dynamically reduced then recovered
+- **Shared typing loop** — single global typing indicator per chat replaces per-task typing, halving Telegram API pressure
+- **Wave animation degradation** — secondary concurrent tasks reduce animation frequency (18s vs 6s) to avoid Pool timeout
+- **Reply-to threading** — concurrent task responses link back to original message via reply_to
+- **Enhanced /tasks** — shows worker utilization, priority labels, tool count, actual runtime
+- **secondary bot instance** — the secondary bot Telegram Bot migrated to CB architecture via CB_HOME isolation
 - **Protected directory guard for headless mode** — `~/.claude/` is a hardcoded protected directory where Edit/Write tools block in `-p` mode waiting for interactive approval. New two-layer system: (1) CLAUDE.md rule instructs Claude to use Bash tools instead; (2) `protected-dir-guard.py` PreToolUse hook intercepts Edit/Write targeting `~/.claude/*` and returns actionable Bash alternatives (exit 2 block + stderr guidance). Enables full Telegram Bot operation without `--dangerously-skip-permissions`
 
 ### Fixed
+- **Pool Timeout eliminated** — connection pool 32→48, pool_timeout 60→90s, shared typing loop reduces concurrent API calls from N*3 to N+1
 - **Pool Timeout + asyncio crash root cause fix** — roundtable diagnosis identified 3-layer cascade: (1) empty `proxy` config caused httpx to bypass mihomo proxy, relying on TUN which can silently hang connections; (2) `POLL_ACTIVITY_STALE_SEC=120` too short, causing false restarts on proxy latency spikes; (3) `RuntimeError: no running event loop` during `run_polling()` shutdown. Fixes: explicit proxy in config, stale threshold raised to 300s, RuntimeError catch for clean exit
+
+### Changed
+- **MAX_CONCURRENT_WORKERS 6→3** — matches Claude Max actual concurrency limit (~2-3 simultaneous claude -p)
 - **cb-watchdog orphan process prevention** — watchdog now checks if launchd manages the process before attempting restart, preventing duplicate instances from competing for Telegram getUpdates
 - **launchd KeepAlive restored** — `ai.claude-bridge` plist existed but wasn't bootstrapped; process had no automatic restart supervision
 - **`/cancel` actually stops running tasks** — three bugs prevented `/cancel` from working: (1) normal messages: partial results were still sent after kill; (2) agent mode: subprocess not registered in `_active_procs`, so `proc.kill()` couldn't reach it; (3) agent exec loop continued to next phase after cancel. All three fixed
