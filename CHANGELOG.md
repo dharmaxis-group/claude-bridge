@@ -2,7 +2,7 @@
 
 All notable changes to Claude Bridge are documented here.
 
-## [Unreleased]
+## [1.7.0] — 2026-03-31
 
 ### Added
 - **Multi-agent parallel processing** — `concurrent_updates` enabled, 3 concurrent workers per user. Send multiple messages simultaneously and they process in parallel
@@ -13,33 +13,29 @@ All notable changes to Claude Bridge are documented here.
 - **Reply-to threading** — concurrent task responses link back to original message via reply_to
 - **Enhanced /tasks** — shows worker utilization, priority labels, tool count, actual runtime
 - **secondary bot instance** — the secondary bot Telegram Bot migrated to CB architecture via CB_HOME isolation
-- **Protected directory guard for headless mode** — `~/.claude/` is a hardcoded protected directory where Edit/Write tools block in `-p` mode waiting for interactive approval. New two-layer system: (1) CLAUDE.md rule instructs Claude to use Bash tools instead; (2) `protected-dir-guard.py` PreToolUse hook intercepts Edit/Write targeting `~/.claude/*` and returns actionable Bash alternatives (exit 2 block + stderr guidance). Enables full Telegram Bot operation without `--dangerously-skip-permissions`
-
-### Fixed
-- **Pool Timeout eliminated** — connection pool 32→48, pool_timeout 60→90s, shared typing loop reduces concurrent API calls from N*3 to N+1
-- **Pool Timeout + asyncio crash root cause fix** — roundtable diagnosis identified 3-layer cascade: (1) empty `proxy` config caused httpx to bypass mihomo proxy, relying on TUN which can silently hang connections; (2) `POLL_ACTIVITY_STALE_SEC=120` too short, causing false restarts on proxy latency spikes; (3) `RuntimeError: no running event loop` during `run_polling()` shutdown. Fixes: explicit proxy in config, stale threshold raised to 300s, RuntimeError catch for clean exit
-
-### Changed
-- **MAX_CONCURRENT_WORKERS 6→3** — matches Claude Max actual concurrency limit (~2-3 simultaneous claude -p)
-- **cb-watchdog orphan process prevention** — watchdog now checks if launchd manages the process before attempting restart, preventing duplicate instances from competing for Telegram getUpdates
-- **launchd KeepAlive restored** — `ai.claude-bridge` plist existed but wasn't bootstrapped; process had no automatic restart supervision
-- **`/cancel` actually stops running tasks** — three bugs prevented `/cancel` from working: (1) normal messages: partial results were still sent after kill; (2) agent mode: subprocess not registered in `_active_procs`, so `proc.kill()` couldn't reach it; (3) agent exec loop continued to next phase after cancel. All three fixed
-- **Telegram 429 rate limit loop** — wave animation was editing messages every 0.4s (~150/min), far exceeding Telegram's ~30/min limit. Added exponential backoff (2x, max 30s) on 429 errors, increased base interval to 3s. Also added 429 backoff to `_stream_reply` progressive text reveal
-- **Runaway session prevention** — `CLAUDE_TIMEOUT` changed from `None` (unlimited) to `3600` (1 hour max). Observed a 13+ hour stuck session causing 3,000+ rate limit errors
-
-### Security
-- **Bot Token log redaction** — httpx logs now mask bot token as `bot****/` via `_GetUpdatesTracker` filter. Cleaned 64,645 historical occurrences from existing log files
-- **GitHub repo set to PRIVATE** — temporarily unpublished from public access
-
-### Added
 - **`/cancel` command** — terminate running Claude operation or agent (`proc.kill()` + cancel event)
 - **Auto-send output files** — images/documents written by Claude are automatically sent to Telegram (PNG/JPG/PDF/CSV etc., 10MB limit)
 - **Context buffer** — persists last 8 conversation exchanges per project in SQLite `context_buffer` table; injects last 3 into new sessions for continuity
 - **Webhook mode** — add `webhookUrl` to config.json to switch from polling to webhook; defaults to polling when absent
 - **Third-layer watchdog** — HTTP-level `getUpdates` activity monitor via httpx log filter; forces restart if no HTTP activity for 2 minutes
+- **Protected directory guard for headless mode** — `~/.claude/` is a hardcoded protected directory where Edit/Write tools block in `-p` mode waiting for interactive approval. New two-layer system: (1) CLAUDE.md rule instructs Claude to use Bash tools instead; (2) `protected-dir-guard.py` PreToolUse hook intercepts Edit/Write targeting `~/.claude/*` and returns actionable Bash alternatives (exit 2 block + stderr guidance). Enables full Telegram Bot operation without `--dangerously-skip-permissions`
+
+### Fixed
+- **Pool Timeout eliminated** — connection pool 32→48, pool_timeout 60→90s, shared typing loop reduces concurrent API calls from N*3 to N+1
+- **Pool Timeout + asyncio crash root cause fix** — roundtable diagnosis identified 3-layer cascade: (1) empty `proxy` config caused httpx to bypass mihomo proxy, relying on TUN which can silently hang connections; (2) `POLL_ACTIVITY_STALE_SEC=120` too short, causing false restarts on proxy latency spikes; (3) `RuntimeError: no running event loop` during `run_polling()` shutdown. Fixes: explicit proxy in config, stale threshold raised to 300s, RuntimeError catch for clean exit
+- **`/cancel` actually stops running tasks** — three bugs prevented `/cancel` from working: (1) normal messages: partial results were still sent after kill; (2) agent mode: subprocess not registered in `_active_procs`, so `proc.kill()` couldn't reach it; (3) agent exec loop continued to next phase after cancel. All three fixed
+- **Telegram 429 rate limit loop** — wave animation was editing messages every 0.4s (~150/min), far exceeding Telegram's ~30/min limit. Added exponential backoff (2x, max 30s) on 429 errors, increased base interval to 3s. Also added 429 backoff to `_stream_reply` progressive text reveal
+- **Runaway session prevention** — `CLAUDE_TIMEOUT` changed from `None` (unlimited) to `3600` (1 hour max). Observed a 13+ hour stuck session causing 3,000+ rate limit errors
 
 ### Changed
+- **MAX_CONCURRENT_WORKERS 6→3** — matches Claude Max actual concurrency limit (~2-3 simultaneous claude -p)
+- **cb-watchdog orphan process prevention** — watchdog now checks if launchd manages the process before attempting restart, preventing duplicate instances from competing for Telegram getUpdates
+- **launchd KeepAlive restored** — `ai.claude-bridge` plist existed but wasn't bootstrapped; process had no automatic restart supervision
 - **Cost tag includes project name** — footer shows `project | model | effort | $cost | time`
+
+### Security
+- **Bot Token log redaction** — httpx logs now mask bot token as `bot****/` via `_GetUpdatesTracker` filter. Cleaned 64,645 historical occurrences from existing log files
+- **GitHub repo set to PRIVATE** — temporarily unpublished from public access
 
 ## [1.6.0] — 2026-03-18
 
