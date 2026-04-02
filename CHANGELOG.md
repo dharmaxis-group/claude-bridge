@@ -36,6 +36,7 @@ All notable changes to Claude Bridge are documented here.
 ### Security
 - **Bot Token log redaction** — httpx logs now mask bot token as `bot****/` via `_GetUpdatesTracker` filter. Cleaned 64,645 historical occurrences from existing log files
 - **GitHub repo set to PRIVATE** — temporarily unpublished from public access
+- **Uptime Kuma push URL moved to config** — hardcoded external IP and push token replaced with `uptimeKumaPushUrl` config field; watchdog updated to match
 
 ## [1.6.0] — 2026-03-18
 
