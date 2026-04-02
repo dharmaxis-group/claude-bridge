@@ -107,11 +107,13 @@ def main():
 
     # Uptime Kuma push 心跳
     try:
-        subprocess.run(
-            ["curl", "-s", "--connect-timeout", "5",
-             "http://<REDACTED_HOST>:3001/api/push/<REDACTED_TOKEN>?status=up&msg=OK&ping="],
-            capture_output=True, text=True, timeout=10,
-        )
+        cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+        hb_url = cfg.get("uptimeKumaPushUrl", "")
+        if hb_url:
+            subprocess.run(
+                ["curl", "-s", "--connect-timeout", "5", hb_url],
+                capture_output=True, text=True, timeout=10,
+            )
     except Exception:
         pass
 

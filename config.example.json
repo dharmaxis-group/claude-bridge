@@ -8,5 +8,6 @@
   "claudeBin": "~/.local/bin/claude",
   "webhookUrl": "",
   "webhookPort": 8443,
-  "webhookSecret": ""
+  "webhookSecret": "",
+  "uptimeKumaPushUrl": ""
 }

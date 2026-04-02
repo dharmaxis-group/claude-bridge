@@ -1618,6 +1618,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"🎤 {transcript}")
         log.info(f"voice transcribed: {transcript[:100]}")
 
+        # Extract quoted message when user replies to a previous message
+        if update.message.reply_to_message:
+            quoted = update.message.reply_to_message
+            quoted_text = quoted.text or quoted.caption or ""
+            if quoted_text:
+                quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+                transcript = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{transcript}"
+                log.info(f"handle_voice: reply context prepended ({len(quoted_text)} chars from {quoted_author})")
+
         # Invoke Claude and get reply text
         reply_text = await _invoke_and_reply(update, context, transcript)
 
@@ -1672,6 +1681,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt += f"\n\nUser message: {caption}"
         else:
             prompt += "\n\nAnalyze this file and summarize what you see."
+
+        # Extract quoted message when user replies to a previous message
+        if update.message.reply_to_message:
+            quoted = update.message.reply_to_message
+            quoted_text = quoted.text or quoted.caption or ""
+            if quoted_text:
+                quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+                prompt = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{prompt}"
+                log.info(f"handle_document: reply context prepended ({len(quoted_text)} chars from {quoted_author})")
 
         await _invoke_and_reply(update, context, prompt)
 
@@ -3057,14 +3075,15 @@ async def _heartbeat_loop():
     """Background task: push heartbeat to Uptime Kuma every 120s."""
     global _watchdog_ts
     import urllib.request
-    _HB_URL = "http://<REDACTED_HOST>:3001/api/push/<REDACTED_TOKEN>?status=up&msg=OK&ping="
+    _HB_URL = _cfg.get("uptimeKumaPushUrl", "")
     await asyncio.sleep(5)
     while True:
         _watchdog_ts = time.time()  # tick for OS thread watchdog
-        try:
-            urllib.request.urlopen(_HB_URL, timeout=5)
-        except Exception:
-            pass
+        if _HB_URL:
+            try:
+                urllib.request.urlopen(_HB_URL, timeout=5)
+            except Exception:
+                pass
         await asyncio.sleep(120)
 
 
