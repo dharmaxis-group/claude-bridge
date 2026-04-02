@@ -26,6 +26,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.error import NetworkError
 from telegram.request import HTTPXRequest
 
 # ── 路径与常量 ──
@@ -953,6 +954,40 @@ def _is_network_error(e: Exception) -> bool:
     """Check if the error is a transient network issue."""
     s = str(e).lower()
     return "connecterror" in s or "networkerror" in s or "timed out" in s or "timeout" in s
+
+
+class RetryHTTPXRequest(HTTPXRequest):
+    """HTTPXRequest with transparent retry for transient network errors.
+
+    Retries ConnectError / RemoteProtocolError / timeout up to 3 times
+    with exponential backoff (1s → 2s → 4s). All other errors pass through.
+    """
+
+    _MAX_RETRIES = 3
+    _BASE_DELAY = 1.0
+
+    async def do_request(self, url, method, request_data=None,
+                         read_timeout=None, write_timeout=None,
+                         connect_timeout=None, pool_timeout=None):
+        last_exc = None
+        for attempt in range(self._MAX_RETRIES + 1):
+            try:
+                return await super().do_request(
+                    url, method, request_data,
+                    read_timeout, write_timeout, connect_timeout, pool_timeout)
+            except NetworkError as e:
+                last_exc = e
+                cause = str(e).lower()
+                retryable = ("connecterror" in cause or "disconnected" in cause
+                             or "timed out" in cause or "timeout" in cause
+                             or "reset" in cause)
+                if not retryable or attempt == self._MAX_RETRIES:
+                    raise
+                delay = self._BASE_DELAY * (2 ** attempt)
+                log.warning(f"RetryHTTPXRequest: retry {attempt+1}/{self._MAX_RETRIES} "
+                            f"in {delay}s — {e}")
+                await asyncio.sleep(delay)
+        raise last_exc
 
 
 async def _stream_reply(bot, chat_id: int, text: str, reuse_msg=None):
@@ -3326,6 +3361,11 @@ async def _auto_review_loop(bot):
 # ── Error Handler ──
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # NetworkError: transient proxy blips — already retried by RetryHTTPXRequest,
+    # suppress to avoid spamming user with "Bot Error" on every hiccup
+    if isinstance(context.error, NetworkError):
+        log.warning(f"NetworkError (suppressed): {context.error}")
+        return
     log.error(f"Unhandled exception: {context.error}", exc_info=context.error)
     # 把错误摘要发回 Telegram，让用户立刻知道
     if update and hasattr(update, "effective_chat") and update.effective_chat:
@@ -3440,12 +3480,12 @@ def main():
         Application.builder()
         .token(token)
         .concurrent_updates(MAX_TOTAL_TASKS)  # P0: enable concurrent handler dispatch
-        .request(HTTPXRequest(connection_pool_size=48, pool_timeout=90.0,
-                             connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
-                             proxy=proxy))
-        .get_updates_request(HTTPXRequest(connection_pool_size=8, pool_timeout=30.0,
-                                          connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
-                                          proxy=proxy))
+        .request(RetryHTTPXRequest(connection_pool_size=48, pool_timeout=90.0,
+                                connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
+                                proxy=proxy))
+        .get_updates_request(RetryHTTPXRequest(connection_pool_size=8, pool_timeout=30.0,
+                                               connect_timeout=15.0, read_timeout=15.0, write_timeout=15.0,
+                                               proxy=proxy))
         .post_init(post_init)
         .build()
     )
