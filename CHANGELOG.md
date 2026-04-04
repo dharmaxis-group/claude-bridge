@@ -2,6 +2,15 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.8.0] — 2026-04-04
+
+### Fixed
+- **Watchdog crash loop (root cause)** — `_heartbeat_loop()` referenced undefined `_cfg` variable, causing `NameError` on every start. Since heartbeat was the sole watchdog feeder, `_watchdog_ts` never updated, triggering `os._exit(1)` every 5 minutes. All streaming responses >5min were killed mid-flight. Both CB Bot and secondary instance affected (same codebase). Fix: `_cfg.get(...)` → `load_config().get(...)`
+
+### Added
+- **Independent watchdog feeder** — `_watchdog_feeder()` coroutine runs every 30s with zero external dependencies, decoupled from Uptime Kuma heartbeat. Heartbeat failures can no longer kill the bot
+- **Reply chain index** — `_msg_chain` stores last 200 messages per chat with reply_to links. Enables multi-level reply chain traversal (up to 5 levels deep) for parallel conversation threading. Bot replies are also indexed. Falls back to single-level quote when chain is not in memory
+
 ## [1.7.0] — 2026-03-31
 
 ### Added
