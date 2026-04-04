@@ -388,6 +388,47 @@ _typing_chats: dict[int, int] = {}  # chat_id -> active_task_count (shared typin
 _typing_loop_task: asyncio.Task | None = None  # single global typing loop
 _context_buffer: dict[str, list[dict]] = {}  # "chat_id:project" -> [{user, assistant, ts}]
 CONTEXT_BUFFER_SIZE = 8  # keep last N exchanges for session continuity
+
+# ── Reply Chain Index (message thread memory) ──
+# Stores recent messages to enable multi-level reply chain traversal.
+# Telegram only gives us the immediate parent; this index lets us walk the full chain.
+_msg_chain: dict[int, dict[int, dict]] = {}  # chat_id -> {msg_id -> {text, author, reply_to}}
+_MSG_CHAIN_MAX = 200  # per chat, evict oldest when exceeded
+
+
+def _chain_record(chat_id: int, msg_id: int, text: str, author: str, reply_to: int | None = None):
+    """Record a message in the reply chain index."""
+    chain = _msg_chain.setdefault(chat_id, {})
+    chain[msg_id] = {"text": text[:500], "author": author, "reply_to": reply_to}
+    # Evict oldest if over limit
+    if len(chain) > _MSG_CHAIN_MAX:
+        oldest = sorted(chain.keys())[:len(chain) - _MSG_CHAIN_MAX]
+        for k in oldest:
+            chain.pop(k, None)
+
+
+def _chain_build_context(chat_id: int, msg_id: int, max_depth: int = 5) -> str:
+    """Walk the reply chain backwards, return formatted thread context."""
+    chain = _msg_chain.get(chat_id, {})
+    thread = []
+    current = msg_id
+    for _ in range(max_depth):
+        entry = chain.get(current)
+        if not entry:
+            break
+        thread.append(entry)
+        if not entry.get("reply_to"):
+            break
+        current = entry["reply_to"]
+    if len(thread) <= 1:
+        return ""  # no chain to show (single message or not found)
+    # Reverse to chronological order, skip the last one (it's the current message)
+    thread = list(reversed(thread[1:]))  # exclude current msg, oldest first
+    lines = []
+    for i, e in enumerate(thread):
+        role = "Bot" if e["author"] == "bot" else "User"
+        lines.append(f"[Thread {i+1}/{len(thread)}] {role}: {e['text']}")
+    return "\n".join(lines)
 WATCHDOG_STALE_SEC = 300  # 5 min without heartbeat tick → force restart
 POLL_ACTIVITY_STALE_SEC = 300  # 5 min without actual getUpdates → force restart (was 120, raised to match WATCHDOG_STALE_SEC — proxy latency spikes were causing false restarts)
 
@@ -1383,6 +1424,11 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Streaming typing effect: progressively reveal text in the progress message
     await _stream_reply(context.bot, chat_id, full_reply, progress_msg)
 
+    # Record bot reply in chain index for multi-level reply tracking
+    if progress_msg:
+        bot_reply_to = update.message.message_id if has_concurrent else None
+        _chain_record(chat_id, progress_msg.message_id, reply_text, "bot", bot_reply_to)
+
     # Auto-send output files (images, small documents)
     _SENDABLE_IMAGES = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
     _SENDABLE_DOCS = {'.pdf', '.csv', '.xlsx', '.json', '.html'}
@@ -1772,16 +1818,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("handle_message: empty text after strip")
         return
 
-    # Extract quoted message when user replies to a previous message
+    chat_id = update.effective_chat.id
+    msg_id = update.message.message_id
+    reply_to_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
+
+    # Record user message in chain index
+    _chain_record(chat_id, msg_id, text, "user", reply_to_id)
+
+    # Also record the quoted message if we haven't seen it
     if update.message.reply_to_message:
         quoted = update.message.reply_to_message
         quoted_text = quoted.text or quoted.caption or ""
-        if quoted_text:
-            quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
-            text = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{text}"
-            log.info(f"handle_message: reply context prepended ({len(quoted_text)} chars from {quoted_author})")
+        quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+        q_reply_to = quoted.reply_to_message.message_id if quoted.reply_to_message else None
+        _chain_record(chat_id, quoted.message_id, quoted_text, quoted_author, q_reply_to)
 
-    log.info(f"handle_message: processing text='{text[:50]}...' from {update.effective_chat.id}")
+    # Build thread context from reply chain (multi-level)
+    if reply_to_id:
+        thread_ctx = _chain_build_context(chat_id, msg_id)
+        if thread_ctx:
+            text = f"[Conversation thread (oldest first):\n{thread_ctx}]\n\n{text}"
+            log.info(f"handle_message: thread context prepended ({thread_ctx.count(chr(10))+1} messages)")
+        else:
+            # Fallback: single-level quote (chain not in index)
+            quoted = update.message.reply_to_message
+            quoted_text = quoted.text or quoted.caption or ""
+            if quoted_text:
+                quoted_author = "bot" if quoted.from_user and quoted.from_user.is_bot else "user"
+                text = f"[Replying to {quoted_author}'s message: {quoted_text}]\n\n{text}"
+                log.info(f"handle_message: reply context prepended ({len(quoted_text)} chars from {quoted_author})")
+
+    log.info(f"handle_message: processing text='{text[:50]}...' from {chat_id}")
 
     # Intercept budget amount input
     if context.user_data.get("awaiting_budget"):
@@ -3106,14 +3173,22 @@ async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _watchdog_feeder():
+    """Independent watchdog feeder — zero external dependencies.
+    Separated from heartbeat so Uptime Kuma failures can't kill the bot."""
+    global _watchdog_ts
+    await asyncio.sleep(2)
+    while True:
+        _watchdog_ts = time.time()
+        await asyncio.sleep(30)
+
+
 async def _heartbeat_loop():
     """Background task: push heartbeat to Uptime Kuma every 120s."""
-    global _watchdog_ts
     import urllib.request
-    _HB_URL = _cfg.get("uptimeKumaPushUrl", "")
+    _HB_URL = load_config().get("uptimeKumaPushUrl", "")
     await asyncio.sleep(5)
     while True:
-        _watchdog_ts = time.time()  # tick for OS thread watchdog
         if _HB_URL:
             try:
                 urllib.request.urlopen(_HB_URL, timeout=5)
@@ -3424,6 +3499,8 @@ async def post_init(app: Application):
     ])
     # Start cron scheduler background task
     _create_background_task(_cron_scheduler(app.bot), name="cron-scheduler")
+    # Start watchdog feeder (independent, zero-dependency)
+    _create_background_task(_watchdog_feeder(), name="watchdog-feeder")
     # Start Uptime Kuma heartbeat
     _create_background_task(_heartbeat_loop(), name="uptime-kuma-heartbeat")
     # Start poll health monitor
