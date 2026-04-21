@@ -90,7 +90,7 @@ TOOL_PROFILES = {
 DEFAULT_TOOL_PROFILE = "readonly"  # kept for reference; --tools no longer passed to claude
 
 MODELS = {
-    "opus": "Opus 4.6",
+    "opus": "Opus 4.7",
     "sonnet": "Sonnet 4.6",
 }
 
