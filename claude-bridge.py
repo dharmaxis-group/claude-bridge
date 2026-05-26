@@ -88,6 +88,37 @@ _SENSITIVE_MSG_KEYWORDS = [
     "帮我存密码", "加密保管", "保管密码", "存储密码",
 ]
 
+# ── P0: 业务整理 skill 强制触发关键词（命中即强制调用 Skill 工具）──
+_BUSINESS_INFO_KEYWORDS_RE = re.compile(
+    r'(车号|车牌|装车|发货|运费每吨|运费每斤|供应商|客户|汇款|付款|收款人|银行帐号|挂车|货主)',
+    re.UNICODE
+)
+
+BUSINESS_INFO_FORCE_PROMPT = (
+    "\n\n[🚨 业务整理强制规则 — 优先级最高 / 覆盖所有简洁规则]\n"
+    "检测到业务关键词。**必须立即调用 Skill 工具加载 business-info-organizer**：\n"
+    "1. 调用方式：使用 Skill 工具，参数 skill='business-info-organizer'\n"
+    "2. 加载后严格按 SKILL.md 流程：\n"
+    "   - 从主人输入提取已知字段（一次性列出，按模板字段顺序）\n"
+    "   - 逐项追问缺失字段（一次问一个，每个 Q 必带完整车牌如「吉AW2908 XX 是？」）\n"
+    "   - 单位/口径含糊必反问（如 34 吨是理论还是过磅）\n"
+    "   - 多商品装车自动展开商品段 ① ② + 合计行\n"
+    "3. 输出**明文**：身份证完整 18 位 / 电话完整 11 位 / 银行卡完整 19 位，**禁止遮蔽**\n"
+    "   （理由：业务员录入 ERP + 内部记录，需完整字段；覆盖 TG 通用'部分遮蔽'规则）\n"
+    "4. 输出**完整模板**（17-18 字段 4 段，公式可验算）\n"
+    "   覆盖 TG 通用'5 行限制'——业务模板需要完整字段\n"
+    "5. 落到 ~/Private/cases/business/{采购单车,销售单车,汇款记录}/<车牌>_<日期>.md\n"
+    "6. 严禁自创简短格式（如「运输信息登记」），严禁省略字段\n"
+    "[强制规则结束]\n"
+)
+
+
+def _maybe_force_business_skill(text: str) -> str:
+    """If business keywords detected, return force-skill prefix; else empty."""
+    if _BUSINESS_INFO_KEYWORDS_RE.search(text or ""):
+        return BUSINESS_INFO_FORCE_PROMPT
+    return ""
+
 TOOL_PROFILES = {
     "readonly": "Read,Grep,Glob,WebSearch,WebFetch",
     "standard": "default",
@@ -1265,6 +1296,10 @@ async def _invoke_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if has_concurrent:
         session_id = None  # Force new session — avoid --resume conflict
         augmented_text = (TELEGRAM_SYSTEM_CONTEXT if _inject_ctx else "") + text
+
+    # ── 强制业务整理 skill 调用（每条消息都注入，包括 resumed session） ──
+    # 关键词命中 → 强制 prompt 注入到 augmented_text 末尾，让 Claude 必须调用 Skill 工具
+    augmented_text = augmented_text + _maybe_force_business_skill(text)
 
     # Auto-detect task priority from content
     _quick_patterns = re.compile(
