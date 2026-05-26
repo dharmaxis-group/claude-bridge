@@ -33,6 +33,18 @@
       "notify_on_error": true,
       "self_notify": true,
       "timeout": 30
+    },
+    {
+      "id": "monthly-distill",
+      "name": "DX 月度蒸馏复盘",
+      "schedule": "0 5 * * 1",
+      "type": "script",
+      "command": "bash ~/Projects/dharmaxis/scripts/dx-monthly-distill.sh",
+      "enabled": true,
+      "notify": false,
+      "notify_on_error": true,
+      "self_notify": true,
+      "timeout": 2700
     }
   ]
 }
