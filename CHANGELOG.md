@@ -2,6 +2,32 @@
 
 All notable changes to Claude Bridge are documented here.
 
+## [1.8.1] — 2026-05-29
+
+First publicly available release. The repository was previously private; this release strips all personal artifacts from both HEAD and git history before going public.
+
+### Added
+- **business-info-organizer skill integration** — when the user's message contains business-domain keywords (车牌 / 装车 / 采购 / 销售 / 汇款 / 供应商 / 客户 / etc.), the bot injects the `business-info-organizer` skill prompt to normalize unstructured Chinese business messages into ERP-ready templates. Includes five quality constraints (A-E: 净重双口径 / 单价校验 / 车牌格式 / 日期标准化 / 字段完整性) and graceful single-item degradation (no auto-numbering, no totals row for single-product entries).
+- **`heartbeat-jobs.example.json`** — schema-annotated template showing how to register cron-style background jobs. Copy to `heartbeat-jobs.json` and customize.
+
+### Removed (public release prep)
+- **`blogger/`** — personal blog theme and posts for `<removed>`; not part of the bridge codebase. The previous theme also contained a client-side SHA-256 gate which was an ineffective access control.
+- **`tts-bench/outputs/`** — voice synthesis benchmark samples containing personal voice prints. The `tts-bench/benchmark.py` and `benchmark_clone.py` scripts are retained so users can run their own benchmarks against their own reference audio.
+- **`skills`** symlink — pointed to an external skills directory. External users should manage skills via their own `~/.claude/skills/` or equivalent.
+- **`heartbeat-jobs.json`** — was a personal jobs file containing maintainer-specific paths; moved to `.gitignore`. Use `heartbeat-jobs.example.json` as a starting point.
+
+### Security
+- **Uptime Kuma push token rotation** — the push token previously committed to `claude-bridge.py` (later moved to `config.json` in v1.8.0) has been revoked at the Uptime Kuma server side. Git history was rewritten with `git filter-repo` to remove the token, the associated server IP, the maintainer's home-directory path, and personal voice samples from all previous commits. The repository was not publicly accessible during the period the token was committed; this rewrite is precautionary in advance of going public.
+- **Author email normalization** — all historical commit authors were rewritten to `noreply@dharmaxis-group.users.noreply.github.com` so the maintainer's personal email does not appear in `git log`.
+
+### Known limitations (read before deploying publicly)
+- **`business-info-organizer` skill is prompt-based, not tool-based** — the bot detects keywords and appends skill instructions to the prompt; it does not invoke the Claude Skill API and does not post-validate model output. A prompt-injection-savvy user could neutralize the skill instruction. The skill is designed for a single-user trusted Bot.
+- **PII is preserved in full** — the business-info workflow intentionally keeps full ID numbers / phone numbers / bank cards in responses for accounting purposes. `_sanitize_response()` only masks credentials adjacent to password keywords, not PII. Do not deploy this bot as a service for untrusted users.
+- **Webhook mode places the bot token in the URL path** — if you enable `webhookUrl`, the Telegram bot token ends up in reverse-proxy access logs. Use polling (default) unless you fully control the network path.
+
+### Note for existing private-period clones
+Earlier commit history was rewritten by `git filter-repo`; all commit hashes prior to v1.8.1 have changed. Existing clones from the private period must re-clone or run `git fetch origin && git reset --hard origin/main` against the new history.
+
 ## [1.8.0] — 2026-04-04
 
 ### Fixed

@@ -1,8 +1,21 @@
 {
+  "_comment": "Copy to heartbeat-jobs.json and customize. heartbeat.py loads jobs from heartbeat-jobs.json at startup.",
+  "_schema": {
+    "id": "unique identifier",
+    "name": "human-readable name",
+    "schedule": "cron expression (minute hour day-of-month month day-of-week)",
+    "type": "script | http",
+    "command": "shell command to run (for type=script)",
+    "enabled": "true | false",
+    "notify": "send Telegram notification on every run (true) or only on error (false)",
+    "notify_on_error": "send notification when command exits non-zero",
+    "self_notify": "send notification to the CB Bot's own chat",
+    "timeout": "max execution time in seconds"
+  },
   "jobs": [
     {
       "id": "github-watch",
-      "name": "GitHub Repo 监控",
+      "name": "GitHub Repo Watch",
       "schedule": "17 10 * * 1",
       "type": "script",
       "command": "python3 ~/.claude-bridge/scripts/github-watch.py",
@@ -14,7 +27,7 @@
     },
     {
       "id": "system-health",
-      "name": "系统健康",
+      "name": "System Health",
       "schedule": "0 */6 * * *",
       "type": "script",
       "command": "python3 ~/.claude-bridge/scripts/system-health.py",
@@ -24,7 +37,7 @@
     },
     {
       "id": "cb-watchdog",
-      "name": "CB 存活检测",
+      "name": "CB Liveness Check",
       "schedule": "*/5 * * * *",
       "type": "script",
       "command": "python3 ~/.claude-bridge/scripts/cb-watchdog.py",
@@ -33,18 +46,6 @@
       "notify_on_error": true,
       "self_notify": true,
       "timeout": 30
-    },
-    {
-      "id": "monthly-distill",
-      "name": "DX 月度蒸馏复盘",
-      "schedule": "0 5 * * 1",
-      "type": "script",
-      "command": "bash ~/Projects/dharmaxis/scripts/dx-monthly-distill.sh",
-      "enabled": true,
-      "notify": false,
-      "notify_on_error": true,
-      "self_notify": true,
-      "timeout": 2700
     }
   ]
 }

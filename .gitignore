@@ -4,14 +4,24 @@ logs/
 *.db
 *.log
 
-# Private config (use config.example.json as template)
+# Private config (use config.example.json / heartbeat-jobs.example.json as templates)
 config.json
+heartbeat-jobs.json
 
 # Internal project management (not for public repo)
 project-files/
 kb-content/
 sync-pipeline.py
 CLAUDE.md
+
+# Personal blog content (not part of CB codebase)
+blogger/
+
+# TTS benchmark voice samples (contains personal voice prints — NEVER commit)
+tts-bench/outputs/
+
+# External skills directory (symlink to user's local skills repo)
+skills
 
 # Python bytecode (leaks source paths in .pyc)
 __pycache__/
