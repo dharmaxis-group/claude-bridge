@@ -4,8 +4,6 @@
 
 A lightweight bridge service that connects Telegram to `claude -p` (Claude Code's headless mode), giving you full Claude Code capabilities from any device. No extra API costs — reuses your Claude Max subscription.
 
-> Blog & Changelog: [<removed>](https://<removed>)
-
 ## Key Features
 
 - **Zero extra cost** — reuses Claude Max subscription ($100/mo). The bridge is pure I/O; all intelligence comes from `claude -p`
@@ -216,4 +214,4 @@ SQLite at `~/.claude-bridge/data/sessions.db` (WAL mode):
 
 ## License
 
-[MIT](LICENSE) — Copyright © 2026 [Dharmaxis Group](<removed>)
+[MIT](LICENSE) — Copyright © 2026 Dharmaxis Group

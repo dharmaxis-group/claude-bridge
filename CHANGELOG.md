@@ -11,7 +11,7 @@ First publicly available release. The repository was previously private; this re
 - **`heartbeat-jobs.example.json`** — schema-annotated template showing how to register cron-style background jobs. Copy to `heartbeat-jobs.json` and customize.
 
 ### Removed (public release prep)
-- **`blogger/`** — personal blog theme and posts for `<removed>`; not part of the bridge codebase. The previous theme also contained a client-side SHA-256 gate which was an ineffective access control.
+- **`blogger/`** — the maintainer's personal blog theme and posts; not part of the bridge codebase. The previous theme also contained a client-side SHA-256 gate which was an ineffective access control.
 - **`tts-bench/outputs/`** — voice synthesis benchmark samples containing personal voice prints. The `tts-bench/benchmark.py` and `benchmark_clone.py` scripts are retained so users can run their own benchmarks against their own reference audio.
 - **`skills`** symlink — pointed to an external skills directory. External users should manage skills via their own `~/.claude/skills/` or equivalent.
 - **`heartbeat-jobs.json`** — was a personal jobs file containing maintainer-specific paths; moved to `.gitignore`. Use `heartbeat-jobs.example.json` as a starting point.
@@ -89,7 +89,7 @@ Earlier commit history was rewritten by `git filter-repo`; all commit hashes pri
 - **No timeout** — removed 900s `CLAUDE_TIMEOUT` to support long-running remote maintenance tasks from phone
 - **Removed smart model routing** — eliminated auto-downgrade to Sonnet/low-effort for short queries; all requests use active model/effort settings
 - **MAX_TURNS 8→50** — prevents complex tasks (sync/review/deploy) from being truncated with empty response when last turn is a tool call
-- **6 projects registered** — added <redacted> and <redacted> to CB project registry
+- **6 projects registered** — added two additional projects to CB project registry
 
 ### Fixed
 - **Model callback validation** — model selection via InlineKeyboard accepted arbitrary values without checking against MODELS whitelist. Now validates `model in MODELS` before writing to DB, consistent with effort/tools handlers
