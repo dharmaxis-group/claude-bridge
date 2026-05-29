@@ -62,7 +62,7 @@ Design decisions:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/user/claude-bridge.git ~/.claude-bridge
+git clone https://github.com/dharmaxis-group/claude-bridge.git ~/.claude-bridge
 
 # 2. Create data directories
 mkdir -p ~/.claude-bridge/{data/images,logs}
