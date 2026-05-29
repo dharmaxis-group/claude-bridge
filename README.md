@@ -212,6 +212,13 @@ SQLite at `~/.claude-bridge/data/sessions.db` (WAL mode):
 - **cost_log** — cost history for `/cost` reports
 - **settings** — key-value store for runtime config (budget, etc.)
 
+## Documentation
+
+- [Features](docs/FEATURES.md) — comprehensive feature listing by category
+- [Why Claude Bridge?](docs/WHY-CLAUDE-BRIDGE.md) — design rationale and use cases
+- [CHANGELOG](CHANGELOG.md) — full version history
+- [Releases](https://github.com/dharmaxis-group/claude-bridge/releases) — release notes per version
+
 ## License
 
 [MIT](LICENSE) — Copyright © 2026 Dharmaxis Group
