@@ -38,7 +38,7 @@ LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
 IMAGE_DIR = CB_HOME / "data" / "images"
 VOICE_DIR = CB_HOME / "data" / "voice"
 
-DEFAULT_MODEL = "opus"
+DEFAULT_MODEL = "fable"
 MAX_TURNS = 50  # enough for complex tasks like sync/review
 MAX_CONCURRENT_WORKERS = 3   # matches Claude Max real concurrency (~2-3 simultaneous claude -p)
 MAX_CONCURRENT_PER_USER = 3
@@ -143,7 +143,8 @@ TOOL_PROFILES = {
 DEFAULT_TOOL_PROFILE = "readonly"  # kept for reference; --tools no longer passed to claude
 
 MODELS = {
-    "opus": "Opus 4.7",
+    "fable": "Fable 5",
+    "opus": "Opus 4.8",
     "sonnet": "Sonnet 4.6",
 }
 
