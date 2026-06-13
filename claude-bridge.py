@@ -38,7 +38,7 @@ LOG_PATH = CB_HOME / "logs" / "claude-bridge.log"
 IMAGE_DIR = CB_HOME / "data" / "images"
 VOICE_DIR = CB_HOME / "data" / "voice"
 
-DEFAULT_MODEL = "fable"
+DEFAULT_MODEL = "opus"  # 2026-06-13 回退 fable→opus：Fable 5 被美国政府出口管制指令全球停用(6/12)，恢复后再切回
 MAX_TURNS = 50  # enough for complex tasks like sync/review
 MAX_CONCURRENT_WORKERS = 3   # matches Claude Max real concurrency (~2-3 simultaneous claude -p)
 MAX_CONCURRENT_PER_USER = 3
